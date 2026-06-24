@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>franka_cartesian_impedance_node</name>
+  <version>0.1.0</version>
+  <description>Direct-libfranka Cartesian impedance node: built-in Cartesian impedance, pose tracking, force readout. Independent of ros2_control / franka_hardware.</description>
+  <maintainer email="todo@todo.todo">todo</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>eigen</depend>
+  <depend>franka</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

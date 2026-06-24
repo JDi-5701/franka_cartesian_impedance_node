@@ -1,0 +1,37 @@
+admittance_node:
+  ros__parameters:
+    robot_ip: "192.168.3.100"
+    # HIGH inner-loop stiffness: stiff/fast/accurate position servo.
+    cartesian_stiffness: [1000.0, 1000.0, 1000.0, 150.0, 150.0, 150.0]
+
+    # Nominal follows the teleop target (~/target_pose): 2nd-order critically damped.
+    follow_gain: 1600.0
+    follow_max_velocity: 1.0          # m/s
+    follow_max_acceleration: 10.0     # m/s^2
+    follow_max_rot_velocity: 2.0      # rad/s
+    follow_max_rot_acceleration: 20.0
+
+    # Virtual admittance (translation): M*xddot + D*xdot + Kv*x = F_ext.
+    # Damping ratio z = D / (2*sqrt(Kv*M)); D=14 -> z~0.7 (snappy return).
+    virtual_mass: 5.0          # kg
+    virtual_damping: 20.0      # N*s/m
+    virtual_stiffness: 200.0    # N/m  (0 = no return to nominal)
+    force_deadband: 2.0        # N
+    force_lowpass_alpha: 0.05
+    force_sign: -1.0           # O_F_ext_hat_K: env-on-robot is negative -> -1 yields with push
+    max_offset: 0.15           # m
+    max_offset_velocity: 0.5       # m/s
+    max_offset_acceleration: 2.0   # m/s^2
+
+    collision_torque_threshold: 20.0
+    collision_force_threshold: 30.0
+    joint_prefix: "fr3_joint"  # published joint names: fr3_joint1..7
+    # libfranka command low-pass (Hz). Lower = smoother command, fewer discontinuity
+    # reflexes, but a bit more lag. 30 is a good start; raise toward 100 for snappier.
+    command_cutoff_hz: 30.0
+    # Debug: a status line is logged every debug_print_period_cycles; on a reflex the
+    # last debug_dump_samples cycles (cmd vel/accel + force + offset) are logged so you
+    # can see what spiked. All via the standard ROS2 logger (no files).
+    debug_buffer_samples: 1000        # ring buffer length (~1s at 1kHz)
+    debug_print_period_cycles: 2000   # status line every ~2s
+    debug_dump_samples: 40            # cycles logged on a reflex

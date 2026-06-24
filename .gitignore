@@ -1,0 +1,14 @@
+# colcon / ament build artifacts
+build/
+install/
+log/
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
