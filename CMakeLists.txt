@@ -24,6 +24,12 @@ ament_target_dependencies(admittance_node rclcpp geometry_msgs sensor_msgs std_m
 target_link_libraries(admittance_node Franka::Franka)
 
 install(TARGETS cartesian_impedance_node admittance_node DESTINATION lib/${PROJECT_NAME})
+
+# gripper_check.py: standalone Franka gripper connectivity/latency test (robot side).
+install(PROGRAMS
+  scripts/gripper_check.py
+  DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 
 ament_package()

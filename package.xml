@@ -16,6 +16,11 @@
   <depend>eigen</depend>
   <depend>franka</depend>
 
+  <!-- gripper_check.py (rclpy + franka_msgs) + franka_gripper server via gripper_server.launch.py -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>franka_msgs</exec_depend>
+  <exec_depend>franka_gripper</exec_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>
