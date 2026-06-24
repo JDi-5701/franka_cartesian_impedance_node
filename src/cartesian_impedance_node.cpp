@@ -5,11 +5,14 @@
 // You publish a target TCP pose; the robot tracks it compliantly. IK/dynamics/gravity/
 // friction are all handled inside the robot. We only do rate-limited interpolation.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -64,6 +67,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
     coll_force_ = declare_parameter<double>("collision_force_threshold", 80.0);    // N
     // libfranka command low-pass (Hz): smooths command jerk -> fewer discontinuity reflexes.
     cutoff_hz_ = declare_parameter<double>("command_cutoff_hz", 30.0);
+    // Debug: ring buffer of command derivatives; on a reflex the cause is classified and
+    // the raw external wrench / joint external torque are logged vs thresholds.
+    dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 1000);
+    dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 40);
+    dbg_.assign(dbg_n_, std::array<double, 11>{});
 
     target_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "~/target_pose", 1, std::bind(&CartesianImpedanceNode::targetCb, this, _1));
@@ -164,6 +172,23 @@ class CartesianImpedanceNode : public rclcpp::Node {
         }
         cmd_q.normalize();
 
+        // debug: command derivatives (what libfranka's continuity checks see) + raw
+        // signals so a reflex can be attributed to an exact channel.
+        if (!deriv_init_) { prev_cmd_p_ = cmd_p; prev_cmd_v_.setZero(); deriv_init_ = true; }
+        Eigen::Vector3d d_v = (cmd_p - prev_cmd_p_) / dt;
+        Eigen::Vector3d d_a = (d_v - prev_cmd_v_) / dt;
+        prev_cmd_p_ = cmd_p; prev_cmd_v_ = d_v;
+        dbg_t_ += dt;
+        peak_v_ = std::max(peak_v_, d_v.norm());
+        peak_a_ = std::max(peak_a_, d_a.norm());
+        dbg_[dbg_i_] = {dbg_t_, d_v.x(), d_v.y(), d_v.z(), d_a.x(), d_a.y(), d_a.z(),
+                       state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
+                       (tp - cmd_p).norm()};
+        dbg_i_ = (dbg_i_ + 1) % dbg_n_;
+        if (dbg_i_ == 0) dbg_full_ = true;
+        for (int i = 0; i < 6; ++i) last_wrench_[i] = state.O_F_ext_hat_K[i];
+        for (int j = 0; j < 7; ++j) last_tau_ext_[j] = state.tau_ext_hat_filtered[j];
+
         franka::CartesianPose out(poseToMatrix(cmd_p, cmd_q));
         if (!running_ || !rclcpp::ok()) {
           return franka::MotionFinished(out);
@@ -174,9 +199,61 @@ class CartesianImpedanceNode : public rclcpp::Node {
       // kJointImpedance, under which setCartesianImpedance() has NO effect (stiff).
       franka::ControllerMode::kCartesianImpedance, true, cutoff_hz_);
     } catch (const franka::Exception& e) {
-      RCLCPP_ERROR(get_logger(), "libfranka exception: %s", e.what());
+      reportReflex(e.what());
+      dumpDebug();
     }
     running_ = false;
+  }
+
+  // Attribute a reflex to an exact channel: classify the cause, then print the raw
+  // external wrench and joint external torque vs the configured thresholds.
+  void reportReflex(const std::string& reason) {
+    RCLCPP_ERROR(get_logger(), "==== REFLEX: %s ====", reason.c_str());
+    std::string cls;
+    if (reason.find("discontinuity") != std::string::npos)
+      cls = "COMMAND DISCONTINUITY -> Franka command-rate limit, our command too jerky. "
+            "Fix: lower trans/rot_filter_gain, raise command_cutoff_hz, slower target.";
+    else if (reason.find("velocity_violation") != std::string::npos ||
+             reason.find("velocity_limit") != std::string::npos)
+      cls = "JOINT VELOCITY LIMIT -> a joint exceeded its max speed (near singularity / "
+            "workspace edge, or commanded too fast). Fix: lower max_translational_velocity, "
+            "stay away from singularities.";
+    else if (reason.find("_reflex") != std::string::npos)
+      cls = "COLLISION -> exceeded YOUR collision_*_threshold (see channels below).";
+    else if (reason.find("limit") != std::string::npos || reason.find("violation") != std::string::npos)
+      cls = "LIMIT -> Franka hardware limit (joint position/torque/singularity).";
+    else
+      cls = "OTHER -> see message above.";
+    RCLCPP_ERROR(get_logger(), "CLASS: %s", cls.c_str());
+
+    const char* wn[6] = {"Fx[N]", "Fy[N]", "Fz[N]", "Tx[Nm]", "Ty[Nm]", "Tz[Nm]"};
+    for (int i = 0; i < 6; ++i) {
+      bool hit = std::abs(last_wrench_[i]) > coll_force_;
+      RCLCPP_WARN(get_logger(), "  O_F_ext %-6s = % 7.2f   (thr %.1f)%s",
+                  wn[i], last_wrench_[i], coll_force_, hit ? "   <== EXCEEDED" : "");
+    }
+    for (int j = 0; j < 7; ++j) {
+      bool hit = std::abs(last_tau_ext_[j]) > coll_torque_;
+      RCLCPP_WARN(get_logger(), "  tau_ext J%d   = % 7.2f   (thr %.1f)%s",
+                  j + 1, last_tau_ext_[j], coll_torque_, hit ? "   <== EXCEEDED" : "");
+    }
+    RCLCPP_WARN(get_logger(),
+                "  peak cmd |v| = %.3f m/s (Franka cmd limit ~1.7)   |a| = %.1f m/s^2 (~13)",
+                peak_v_, peak_a_);
+  }
+
+  void dumpDebug() {
+    size_t avail = dbg_full_ ? dbg_n_ : dbg_i_;
+    size_t count = std::min(avail, dbg_dump_);
+    size_t first = (dbg_i_ + dbg_n_ - count) % dbg_n_;
+    RCLCPP_WARN(get_logger(), "---- last %zu cycles (t | cmd_v | cmd_a | O_F_ext xyz | "
+                "cmd-target lag) ----", count);
+    for (size_t k = 0; k < count; ++k) {
+      const auto& r = dbg_[(first + k) % dbg_n_];
+      RCLCPP_WARN(get_logger(),
+                  "t=%.3f v=[% .3f % .3f % .3f] a=[% 7.1f % 7.1f % 7.1f] F=[% .1f % .1f % .1f] lag=%.3f",
+                  r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
+    }
   }
 
   void publishState(const franka::RobotState& state) {
@@ -212,6 +289,17 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double max_v_, max_a_, max_w_, max_walpha_;
   double trans_gain_, rot_gain_;
   double coll_torque_, coll_force_, cutoff_hz_;
+
+  // debug
+  std::vector<std::array<double, 11>> dbg_;
+  size_t dbg_n_{1000}, dbg_i_{0}, dbg_dump_{40};
+  bool dbg_full_{false};
+  double dbg_t_{0.0};
+  Eigen::Vector3d prev_cmd_p_{Eigen::Vector3d::Zero()}, prev_cmd_v_{Eigen::Vector3d::Zero()};
+  bool deriv_init_{false};
+  double peak_v_{0.0}, peak_a_{0.0};
+  std::array<double, 6> last_wrench_{};
+  std::array<double, 7> last_tau_ext_{};
 
   std::mutex target_mtx_;
   Eigen::Vector3d target_p_{Eigen::Vector3d::Zero()};

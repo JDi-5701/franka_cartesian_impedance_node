@@ -27,8 +27,12 @@ AMPLITUDE = 0.1       # [m] half-stroke (peak-to-peak = 2*AMPLITUDE)
 PERIOD = 10.0         # [s] one full back-and-forth cycle
 TOTAL_TIME = 12.0     # [s] how long to keep oscillating
 RATE = 100.0          # [Hz] command publish rate
-POSE_TOPIC = "/admittance_node/current_pose"
-CMD_TOPIC = "/admittance_node/target_pose"
+import os
+# Controller namespace: works on EITHER controller (default cartesian_impedance_node;
+# set CTRL_NS=/admittance_node to target the admittance node).
+NS = os.environ.get("CTRL_NS", "/cartesian_impedance_node")
+POSE_TOPIC = f"{NS}/current_pose"
+CMD_TOPIC = f"{NS}/target_pose"
 # ----------------
 
 AXES = {"x": 0, "y": 1, "z": 2}

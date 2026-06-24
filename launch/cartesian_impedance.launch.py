@@ -7,7 +7,7 @@ import os
 def generate_launch_description():
     params = os.path.join(
         get_package_share_directory("franka_cartesian_impedance_node"),
-        "config", "params.yaml",
+        "config", "impedance_params.yaml",
     )
     return LaunchDescription([
         Node(

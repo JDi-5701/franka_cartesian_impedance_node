@@ -11,6 +11,7 @@ commanded). This is what matters for slow assembly, unlike dynamic tracking lag.
 Tune the constants below.
 """
 
+import os
 import time
 
 import rclpy
@@ -21,8 +22,10 @@ from geometry_msgs.msg import PoseStamped
 AXIS = "y"                       # axis to step along: "x", "y" or "z"
 STEPS_MM = [0, 20, 40, 20, 0, -20, -40, -20, 0]  # offsets from start [mm]
 SETTLE_T = 3.0                   # [s] wait for settle before measuring
-POSE_TOPIC = "/cartesian_impedance_node/current_pose"
-CMD_TOPIC = "/cartesian_impedance_node/target_pose"
+# Controller namespace: works on EITHER controller (set CTRL_NS=/admittance_node to switch).
+NS = os.environ.get("CTRL_NS", "/cartesian_impedance_node")
+POSE_TOPIC = f"{NS}/current_pose"
+CMD_TOPIC = f"{NS}/target_pose"
 # ----------------
 
 AXES = {"x": 0, "y": 1, "z": 2}

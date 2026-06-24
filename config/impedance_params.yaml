@@ -1,0 +1,21 @@
+cartesian_impedance_node:
+  ros__parameters:
+    robot_ip: "192.168.3.100"
+    # Built-in (true) Cartesian impedance stiffness [x, y, z, roll, pitch, yaw].
+    # translational 10..3000 N/m, rotational 10..300 Nm/rad. Lower = more compliant.
+    # 300 N/m = KUKA-like compliant: stable on contact (yields, no smash), some dynamic
+    # tracking lag in free space (inherent to low-stiffness impedance).
+    cartesian_stiffness: [300.0, 300.0, 300.0, 30.0, 30.0, 30.0]
+    # Command filter limits (keep moderate for teleop: stepped targets stay smooth -> no reflex).
+    max_translational_velocity: 0.5       # m/s
+    max_translational_acceleration: 5.0   # m/s^2
+    max_rotational_velocity: 1.0          # rad/s
+    max_rotational_acceleration: 5.0      # rad/s^2
+    # 2nd-order command filter stiffness (higher = snappier; lower = smoother/softer).
+    trans_filter_gain: 600.0
+    rot_filter_gain: 500.0
+    # Collision reflex thresholds (higher = push harder before reflex stops it).
+    collision_torque_threshold: 15.0   # Nm
+    collision_force_threshold: 30.0     # N
+    # libfranka command low-pass (Hz): smooths command jerk -> fewer discontinuity reflexes.
+    command_cutoff_hz: 30.0
