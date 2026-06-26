@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,9 +25,14 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <franka_cartesian_impedance_msgs/srv/go_to_pose.hpp>
 
 using std::placeholders::_1;
+using std::placeholders::_2;
 
 namespace {
 
@@ -67,16 +74,48 @@ class CartesianImpedanceNode : public rclcpp::Node {
     coll_force_ = declare_parameter<double>("collision_force_threshold", 80.0);    // N
     // libfranka command low-pass (Hz): smooths command jerk -> fewer discontinuity reflexes.
     cutoff_hz_ = declare_parameter<double>("command_cutoff_hz", 30.0);
+    // Homing (~/go_pose, ~/go_home): slow, safe creep to a commanded pose, ignoring target_pose.
+    homing_velocity_ = declare_parameter<double>("homing_velocity", 0.08);          // m/s
+    homing_pos_tol_ = declare_parameter<double>("homing_position_tolerance", 0.004);  // m
+    homing_rot_tol_ = declare_parameter<double>("homing_rotation_tolerance", 0.02);   // rad
+    homing_timeout_ = declare_parameter<double>("homing_timeout", 20.0);             // s
+    // Default home pose [x, y, z, qx, qy, qz, qw] (base frame). Used by ~/go_home (Trigger)
+    // and by ~/go_pose when its request carries no pose (empty / zero quaternion).
+    auto hp = declare_parameter<std::vector<double>>(
+        "home_pose", {0.3, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0});
+    if (hp.size() == 7) {
+      home_p_ = Eigen::Vector3d(hp[0], hp[1], hp[2]);
+      home_q_ = Eigen::Quaterniond(hp[6], hp[3], hp[4], hp[5]);  // (w, x, y, z)
+      home_pose_valid_ = home_q_.norm() > 1e-6;
+      if (home_pose_valid_) home_q_.normalize();
+    } else {
+      RCLCPP_WARN(get_logger(), "home_pose must have 7 elements [x y z qx qy qz qw]; "
+                  "got %zu -> ~/go_home and empty ~/go_pose will be rejected", hp.size());
+    }
     // Debug: ring buffer of command derivatives; on a reflex the cause is classified and
     // the raw external wrench / joint external torque are logged vs thresholds.
     dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 1000);
     dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 40);
     dbg_.assign(dbg_n_, std::array<double, 11>{});
+    // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
+    joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
 
     target_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "~/target_pose", 1, std::bind(&CartesianImpedanceNode::targetCb, this, _1));
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/current_pose", 10);
     wrench_pub_ = create_publisher<geometry_msgs::msg::WrenchStamped>("~/ext_wrench", 10);
+    // Full robot state for downstream (RViz / LeRobot recording / policies).
+    joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("~/joint_states", 10);
+    twist_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("~/ee_twist", 10);
+    desired_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("~/desired_pose", 10);
+
+    // ~/go_pose (GoToPose): go to an arbitrary commanded pose (custom interface).
+    go_pose_srv_ = create_service<franka_cartesian_impedance_msgs::srv::GoToPose>(
+        "~/go_pose", std::bind(&CartesianImpedanceNode::goPoseCb, this, _1, _2));
+    // ~/go_home (std_srvs/Trigger): go to the configured home_pose. Standard type -> callable
+    // from any PC (RoboStack operator side) without building this package's custom srv.
+    go_home_srv_ = create_service<std_srvs::srv::Trigger>(
+        "~/go_home", std::bind(&CartesianImpedanceNode::goHomeCb, this, _1, _2));
 
     control_thread_ = std::thread(&CartesianImpedanceNode::controlLoop, this);
   }
@@ -93,6 +132,64 @@ class CartesianImpedanceNode : public rclcpp::Node {
     target_q_ = Eigen::Quaterniond(msg->pose.orientation.w, msg->pose.orientation.x,
                                    msg->pose.orientation.y, msg->pose.orientation.z);
     have_target_ = true;
+  }
+
+  // Shared homing motion: drive the equilibrium to (gp, gq) at velocity cap v, ignoring
+  // target_pose until reached. Blocks until reached (or timeout). The control loop does the
+  // motion and signals completion via homing_cv_; on success it latches target_ = goal so
+  // the arm holds there until a teleop/policy re-takes over. Returns success + fills msg.
+  bool driveToPose(const Eigen::Vector3d& gp, const Eigen::Quaterniond& gq, double v,
+                   std::string& msg) {
+    {
+      std::lock_guard<std::mutex> lk(homing_mtx_);
+      homing_p_ = gp;
+      homing_q_ = gq.normalized();
+      homing_v_eff_ = v > 0.0 ? v : homing_velocity_;
+      homing_done_ = false;
+      homing_active_ = true;
+    }
+    RCLCPP_INFO(get_logger(), "homing: to [% .3f % .3f % .3f] @ %.2f m/s",
+                gp.x(), gp.y(), gp.z(), homing_v_eff_);
+    std::unique_lock<std::mutex> lk(homing_mtx_);
+    const bool ok = homing_cv_.wait_for(
+        lk, std::chrono::duration<double>(homing_timeout_), [this] { return homing_done_; });
+    if (!ok) homing_active_ = false;  // give up; the loop falls back to target_ (last cmd)
+    msg = ok ? "reached home pose" : "homing timeout / not reached";
+    RCLCPP_INFO(get_logger(), "homing: %s", msg.c_str());
+    return ok;
+  }
+
+  // ~/go_pose (GoToPose): drive to the requested pose. An empty request (zero quaternion)
+  // falls back to the configured default home_pose.
+  void goPoseCb(
+      const std::shared_ptr<franka_cartesian_impedance_msgs::srv::GoToPose::Request> req,
+      std::shared_ptr<franka_cartesian_impedance_msgs::srv::GoToPose::Response> resp) {
+    Eigen::Vector3d gp(req->pose.position.x, req->pose.position.y, req->pose.position.z);
+    Eigen::Quaterniond gq(req->pose.orientation.w, req->pose.orientation.x,
+                          req->pose.orientation.y, req->pose.orientation.z);
+    if (gq.norm() < 1e-6) {  // no pose in request -> default home_pose
+      if (!home_pose_valid_) {
+        resp->success = false;
+        resp->message = "no pose in request and no valid default home_pose param";
+        return;
+      }
+      gp = home_p_;
+      gq = home_q_;
+      RCLCPP_INFO(get_logger(), "go_pose: empty request -> using default home_pose");
+    }
+    resp->success = driveToPose(gp, gq, req->max_velocity, resp->message);
+  }
+
+  // ~/go_home (std_srvs/Trigger): standard, no custom type needed -> callable from any machine
+  // (e.g. the RoboStack operator PC) with zero custom packages. Always drives to home_pose.
+  void goHomeCb(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+              std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
+    if (!home_pose_valid_) {
+      resp->success = false;
+      resp->message = "no valid default home_pose param";
+      return;
+    }
+    resp->success = driveToPose(home_p_, home_q_, homing_velocity_, resp->message);
   }
 
   void controlLoop() {
@@ -133,10 +230,22 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
         publishState(state);
 
-        // Fetch latest target.
+        // Fetch the goal. A homing request (~/go_home) OVERRIDES target_pose until reached,
+        // and creeps at a slower velocity cap so the reset is smooth/safe.
         Eigen::Vector3d tp;
         Eigen::Quaterniond tq;
+        bool homing = false;
+        double vcap = max_v_;
         {
+          std::lock_guard<std::mutex> lk(homing_mtx_);
+          homing = homing_active_;
+          if (homing) {
+            tp = homing_p_;
+            tq = homing_q_;
+            vcap = std::min(max_v_, homing_v_eff_);
+          }
+        }
+        if (!homing) {
           std::lock_guard<std::mutex> lk(target_mtx_);
           tp = target_p_;
           tq = target_q_;
@@ -153,7 +262,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
         Eigen::Vector3d acc = trans_gain_ * (tp - cmd_p) - kd_t * cmd_v;
         if (acc.norm() > max_a_) acc = acc.normalized() * max_a_;        // accel safety clamp
         cmd_v += acc * dt;
-        if (cmd_v.norm() > max_v_) cmd_v = cmd_v.normalized() * max_v_;  // velocity safety clamp
+        if (cmd_v.norm() > vcap) cmd_v = cmd_v.normalized() * vcap;  // velocity safety clamp (homing -> slower)
         cmd_p += cmd_v * dt;
 
         // orientation: velocity- AND acceleration-limited (same scheme as position)
@@ -171,6 +280,29 @@ class CartesianImpedanceNode : public rclcpp::Node {
           cmd_q = Eigen::Quaterniond(Eigen::AngleAxisd(wn * dt, cmd_w / wn)) * cmd_q;
         }
         cmd_q.normalize();
+
+        // homing complete? (close in position + orientation + nearly stopped) -> latch the
+        // home as the standing target and signal the waiting service call.
+        if (homing) {
+          double perr = (tp - cmd_p).norm();
+          Eigen::Quaterniond dqh = tq * cmd_q.inverse();
+          if (dqh.w() < 0) dqh.coeffs() *= -1.0;
+          double rerr = 2.0 * std::acos(std::min(1.0, std::abs(dqh.w())));
+          if (perr < homing_pos_tol_ && rerr < homing_rot_tol_ && cmd_v.norm() < 0.005) {
+            {
+              std::lock_guard<std::mutex> lk(target_mtx_);
+              target_p_ = tp;
+              target_q_ = tq;
+              have_target_ = true;
+            }
+            {
+              std::lock_guard<std::mutex> lk(homing_mtx_);
+              homing_active_ = false;
+              homing_done_ = true;
+            }
+            homing_cv_.notify_all();
+          }
+        }
 
         // debug: command derivatives (what libfranka's continuity checks see) + raw
         // signals so a reflex can be attributed to an exact channel.
@@ -282,6 +414,44 @@ class CartesianImpedanceNode : public rclcpp::Node {
     ws.wrench.torque.y = state.O_F_ext_hat_K[4];
     ws.wrench.torque.z = state.O_F_ext_hat_K[5];
     wrench_pub_->publish(ws);
+
+    // Joint state: q / dq / tau_J in one standard message (RViz / recording / policies).
+    sensor_msgs::msg::JointState js;
+    js.header.stamp = ps.header.stamp;
+    js.name.resize(7); js.position.resize(7); js.velocity.resize(7); js.effort.resize(7);
+    for (int i = 0; i < 7; ++i) {
+      js.name[i] = joint_prefix_ + std::to_string(i + 1);
+      js.position[i] = state.q[i];
+      js.velocity[i] = state.dq[i];
+      js.effort[i] = state.tau_J[i];
+    }
+    joint_pub_->publish(js);
+
+    // Desired EE twist in base frame (O_dP_EE_d): [vx vy vz wx wy wz].
+    geometry_msgs::msg::TwistStamped ts;
+    ts.header = ps.header;
+    ts.twist.linear.x = state.O_dP_EE_d[0];
+    ts.twist.linear.y = state.O_dP_EE_d[1];
+    ts.twist.linear.z = state.O_dP_EE_d[2];
+    ts.twist.angular.x = state.O_dP_EE_d[3];
+    ts.twist.angular.y = state.O_dP_EE_d[4];
+    ts.twist.angular.z = state.O_dP_EE_d[5];
+    twist_pub_->publish(ts);
+
+    // Impedance-desired EE pose (O_T_EE_d): compare vs current_pose to read tracking lag.
+    Eigen::Vector3d pd;
+    Eigen::Quaterniond qd;
+    matrixToPose(state.O_T_EE_d, pd, qd);
+    geometry_msgs::msg::PoseStamped pds;
+    pds.header = ps.header;
+    pds.pose.position.x = pd.x();
+    pds.pose.position.y = pd.y();
+    pds.pose.position.z = pd.z();
+    pds.pose.orientation.w = qd.w();
+    pds.pose.orientation.x = qd.x();
+    pds.pose.orientation.y = qd.y();
+    pds.pose.orientation.z = qd.z();
+    desired_pose_pub_->publish(pds);
   }
 
   std::string robot_ip_;
@@ -289,6 +459,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double max_v_, max_a_, max_w_, max_walpha_;
   double trans_gain_, rot_gain_;
   double coll_torque_, coll_force_, cutoff_hz_;
+  double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
+  std::string joint_prefix_;
 
   // debug
   std::vector<std::array<double, 11>> dbg_;
@@ -306,17 +478,41 @@ class CartesianImpedanceNode : public rclcpp::Node {
   Eigen::Quaterniond target_q_{Eigen::Quaterniond::Identity()};
   bool have_target_{false};
 
+  // homing (~/go_home): control thread reads homing_active_; service waits on homing_cv_.
+  std::mutex homing_mtx_;
+  std::condition_variable homing_cv_;
+  bool homing_active_{false};
+  bool homing_done_{false};
+  Eigen::Vector3d homing_p_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond homing_q_{Eigen::Quaterniond::Identity()};
+  double homing_v_eff_{0.08};
+
+  // default home pose for ~/go_home when the request has no pose (see home_pose param)
+  Eigen::Vector3d home_p_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond home_q_{Eigen::Quaterniond::Identity()};
+  bool home_pose_valid_{false};
+
   std::atomic<bool> running_{true};
   std::thread control_thread_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr desired_pose_pub_;
+  rclcpp::Service<franka_cartesian_impedance_msgs::srv::GoToPose>::SharedPtr go_pose_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr go_home_srv_;
 };
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<CartesianImpedanceNode>());
+  // MultiThreaded so the blocking ~/go_home service callback (waits for homing to finish)
+  // does not stall the rest of the node's callbacks.
+  auto node = std::make_shared<CartesianImpedanceNode>();
+  rclcpp::executors::MultiThreadedExecutor exec;
+  exec.add_node(node);
+  exec.spin();
   rclcpp::shutdown();
   return 0;
 }

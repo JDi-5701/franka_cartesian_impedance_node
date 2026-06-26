@@ -4,7 +4,9 @@
   <name>franka_cartesian_impedance_node</name>
   <version>0.1.0</version>
   <description>Direct-libfranka Cartesian impedance node: built-in Cartesian impedance, pose tracking, force readout. Independent of ros2_control / franka_hardware.</description>
-  <maintainer email="todo@todo.todo">todo</maintainer>
+  <maintainer email="jding@uni-bremen.de">Junsheng Ding</maintainer>
+  <maintainer email="ding@fortiss.de">Junsheng Ding</maintainer>
+  <author email="jding@uni-bremen.de">Junsheng Ding</author>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -13,8 +15,11 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>eigen</depend>
   <depend>franka</depend>
+  <!-- GoToPose.srv lives in this interface-only package -->
+  <depend>franka_cartesian_impedance_msgs</depend>
 
   <!-- gripper_check.py (rclpy + franka_msgs) + franka_gripper server via gripper_server.launch.py -->
   <exec_depend>rclpy</exec_depend>

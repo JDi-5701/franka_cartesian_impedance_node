@@ -1,0 +1,41 @@
+cartesian_impedance_torque_node:
+  ros__parameters:
+    robot_ip: "192.168.3.100"
+    # Cartesian stiffness [x, y, z, roll, pitch, yaw]. translational N/m, rotational
+    # Nm/rad. Lower = more compliant. Unlike the built-in node, the damping is NOT a
+    # constant here: it is recomputed every cycle from K and the configuration-dependent
+    # Cartesian inertia (factorization damping), so compliance stays well-damped as the
+    # arm moves. Start moderate and lower for softer teleop.
+    cartesian_stiffness: [400.0, 400.0, 400.0, 30.0, 30.0, 30.0]
+    # Modal damping ratio applied to every eigen-direction of (K, Lambda). 1.0 = critical
+    # (no overshoot). <1 = springy, >1 = sluggish. Keep ~1.0.
+    damping_ratio: 1.0
+    # Nullspace posture stiffness (pulls the 7th DOF toward the startup configuration).
+    nullspace_stiffness: 10.0
+    # Equilibrium setpoint smoothing (2nd-order critically-damped filter toward
+    # target_pose) so the commanded equilibrium never steps -> torque stays continuous.
+    trans_filter_gain: 200.0
+    rot_filter_gain: 200.0
+    max_translational_velocity: 0.5       # m/s   (equilibrium creep cap, safety)
+    max_translational_acceleration: 2.0   # m/s^2
+    max_rotational_velocity: 1.0          # rad/s
+    max_rotational_acceleration: 2.0      # rad/s^2
+    # Torque rate limit (Nm per 1 kHz cycle): smooth torque -> no command-discontinuity
+    # reflex and no joint-elasticity excitation.
+    delta_tau_max: 1.0
+    # Regularization added to (J M^-1 J^T) and (J J^T) before inversion -> stable near
+    # kinematic singularities. Raise if you see torque spikes at the workspace edge.
+    singularity_eps: 1.0e-6
+    # Collision reflex thresholds (higher = push harder before reflex stops it).
+    collision_torque_threshold: 20.0   # Nm
+    collision_force_threshold: 30.0     # N
+    joint_prefix: "fr3_joint"
+    # --- debug logging ---
+    # The 1 kHz loop only fills a ring buffer; a separate thread writes the CSV + a
+    # throttled console summary. Verify: fact_resid & damp_resid must stay ~1e-12
+    # (factorization + damping math correct); tau_headroom > 0 (not saturating joint
+    # torque limits); rate_clip mostly 0 (delta_tau_max not constantly clipping).
+    debug_buffer_samples: 4000          # ring buffer size (~4 s at 1 kHz)
+    debug_log_file: "impedance_torque_debug.csv"   # CSV path (relative to launch cwd)
+    debug_log_rate_hz: 200.0            # CSV decimation (200 Hz -> every 5th cycle)
+    debug_print_rate_hz: 1.0           # console summary rate

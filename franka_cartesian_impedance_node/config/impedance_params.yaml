@@ -22,3 +22,12 @@ cartesian_impedance_node:
     collision_force_threshold: 30.0     # N
     # libfranka command low-pass (Hz): smooths command jerk -> fewer discontinuity reflexes.
     command_cutoff_hz: 30.0
+    # ~/go_pose & ~/go_home: slow safe creep to a pose, ignoring target_pose until reached.
+    homing_velocity: 0.08              # m/s cap while homing (request can override)
+    homing_position_tolerance: 0.004   # m  reached when within this
+    homing_rotation_tolerance: 0.02    # rad
+    homing_timeout: 20.0               # s  service gives up after this
+    # Default home pose [x, y, z, qx, qy, qz, qw] (base frame). ~/go_home (Trigger) always
+    # goes here; ~/go_pose falls back here when its request has no pose (empty / zero quat).
+    # Set this to your real ready/home pose. qw is last; (1,0,0,0)=TCP pointing down.
+    home_pose: [0.3, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]

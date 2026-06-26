@@ -1,0 +1,9 @@
+# Drive the impedance equilibrium SMOOTHLY to this TCP pose (base frame), IGNORING
+# ~/target_pose until reached. The call blocks until the pose is reached (or timeout/abort).
+# If 'pose' is left empty (zero quaternion), the node falls back to its 'home_pose' param
+# (see config/impedance_params.yaml) -> calling with "{}" goes to the default home.
+geometry_msgs/Pose pose
+float64 max_velocity      # m/s cap during homing; <= 0 -> use the node's homing_velocity param
+---
+bool success
+string message
