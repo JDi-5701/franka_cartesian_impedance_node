@@ -30,6 +30,7 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <franka_cartesian_impedance_msgs/srv/go_to_pose.hpp>
+#include <franka_cartesian_impedance_msgs/msg/control_state.hpp>
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -79,6 +80,12 @@ class CartesianImpedanceNode : public rclcpp::Node {
     homing_pos_tol_ = declare_parameter<double>("homing_position_tolerance", 0.004);  // m
     homing_rot_tol_ = declare_parameter<double>("homing_rotation_tolerance", 0.02);   // rad
     homing_timeout_ = declare_parameter<double>("homing_timeout", 20.0);             // s
+    // GUARD: after homing (and at startup) the controller IGNORES target_pose until an
+    // incoming target comes within these tolerances of the measured pose -> then resumes
+    // following it. Safe hand-over without any external lock; clients just keep publishing.
+    guard_pos_tol_ = declare_parameter<double>("guard_position_tolerance", 0.10);          // m
+    guard_rot_tol_ = declare_parameter<double>("guard_rotation_tolerance_deg", 20.0)
+                     * M_PI / 180.0;                                                       // rad
     // Default home pose [x, y, z, qx, qy, qz, qw] (base frame). Used by ~/go_home (Trigger)
     // and by ~/go_pose when its request carries no pose (empty / zero quaternion).
     auto hp = declare_parameter<std::vector<double>>(
@@ -116,6 +123,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // from any PC (RoboStack operator side) without building this package's custom srv.
     go_home_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/go_home", std::bind(&CartesianImpedanceNode::goHomeCb, this, _1, _2));
+
+    // Advisory control-mode status (TOPIC/HOMING/GUARD + target gap). Latched so a late
+    // subscriber (GUI) immediately sees the current mode. Read-only for everyone else.
+    control_state_pub_ = create_publisher<franka_cartesian_impedance_msgs::msg::ControlState>(
+        "~/control_state", rclcpp::QoS(1).transient_local());
 
     control_thread_ = std::thread(&CartesianImpedanceNode::controlLoop, this);
   }
@@ -211,6 +223,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
                   robot_ip_.c_str());
 
       bool initialized = false;
+      int status_ctr = 0;          // throttles ~/control_state publishing
       Eigen::Vector3d cmd_p;       // current commanded translation
       Eigen::Vector3d cmd_v = Eigen::Vector3d::Zero();  // current commanded translational velocity
       Eigen::Quaterniond cmd_q;    // current commanded orientation
@@ -225,17 +238,28 @@ class CartesianImpedanceNode : public rclcpp::Node {
             target_p_ = cmd_p;
             target_q_ = cmd_q;
           }
+          hold_p_ = cmd_p;          // launch in GUARD, parked at the start pose, until a
+          hold_q_ = cmd_q;          // near target_pose arrives (guard_active_ defaults true)
           initialized = true;
         }
 
         publishState(state);
 
-        // Fetch the goal. A homing request (~/go_home) OVERRIDES target_pose until reached,
-        // and creeps at a slower velocity cap so the reset is smooth/safe.
+        // measured pose (for the GUARD gap check + status)
+        Eigen::Vector3d meas_p;
+        Eigen::Quaterniond meas_q;
+        matrixToPose(state.O_T_EE, meas_p, meas_q);
+
+        // ---- control-mode arbitration: HOMING > GUARD > TOPIC ----------------------------
+        // HOMING (a go_* srv) overrides target_pose and creeps to the goal. After homing (and
+        // at startup) we sit in GUARD: hold the parked pose and IGNORE target_pose until an
+        // incoming target comes within (guard_pos_tol_, guard_rot_tol_) of the measured pose,
+        // then resume TOPIC. Safe hand-over is the controller's job; clients just publish.
         Eigen::Vector3d tp;
         Eigen::Quaterniond tq;
-        bool homing = false;
         double vcap = max_v_;
+        const char* mode_str = "TOPIC";
+        bool homing = false;
         {
           std::lock_guard<std::mutex> lk(homing_mtx_);
           homing = homing_active_;
@@ -245,7 +269,31 @@ class CartesianImpedanceNode : public rclcpp::Node {
             vcap = std::min(max_v_, homing_v_eff_);
           }
         }
-        if (!homing) {
+        // gap between the latest target_pose and the measured pose (guard + status readout)
+        double tgt_pos_err, tgt_rot_err;
+        bool has_tgt;
+        {
+          std::lock_guard<std::mutex> lk(target_mtx_);
+          has_tgt = have_target_;
+          tgt_pos_err = (target_p_ - meas_p).norm();
+          Eigen::Quaterniond dqt = target_q_ * meas_q.inverse();
+          if (dqt.w() < 0) dqt.coeffs() *= -1.0;
+          tgt_rot_err = 2.0 * std::acos(std::min(1.0, std::abs(dqt.w())));
+        }
+        if (homing) {
+          mode_str = "HOMING";
+        } else if (guard_active_) {
+          // release the guard once a fresh target is close enough to the current pose
+          if (has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
+            guard_active_ = false;
+            RCLCPP_INFO(get_logger(), "GUARD released -> TOPIC control");
+          }
+        }
+        if (!homing && guard_active_) {
+          tp = hold_p_;             // hold the parked pose; ignore target_pose
+          tq = hold_q_;
+          mode_str = "GUARD";
+        } else if (!homing) {
           std::lock_guard<std::mutex> lk(target_mtx_);
           tp = target_p_;
           tq = target_q_;
@@ -300,8 +348,21 @@ class CartesianImpedanceNode : public rclcpp::Node {
               homing_active_ = false;
               homing_done_ = true;
             }
+            hold_p_ = tp;            // park here and GUARD until a near target_pose arrives
+            hold_q_ = tq;            // (else teleop's stale equilibrium would yank the arm)
+            guard_active_ = true;
             homing_cv_.notify_all();
           }
+        }
+
+        // publish advisory control-mode status at ~20 Hz (state + gap to the latest target).
+        if (++status_ctr >= 50) {
+          status_ctr = 0;
+          franka_cartesian_impedance_msgs::msg::ControlState cs;
+          cs.state = mode_str;
+          cs.position_error = tgt_pos_err;
+          cs.orientation_error = tgt_rot_err * 180.0 / M_PI;
+          control_state_pub_->publish(cs);
         }
 
         // debug: command derivatives (what libfranka's continuity checks see) + raw
@@ -460,6 +521,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double trans_gain_, rot_gain_;
   double coll_torque_, coll_force_, cutoff_hz_;
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
+  double guard_pos_tol_, guard_rot_tol_;
   std::string joint_prefix_;
 
   // debug
@@ -492,6 +554,12 @@ class CartesianImpedanceNode : public rclcpp::Node {
   Eigen::Quaterniond home_q_{Eigen::Quaterniond::Identity()};
   bool home_pose_valid_{false};
 
+  // GUARD: hold this parked pose and ignore target_pose until a near target arrives. Written
+  // and read only by the control thread (start-up + homing-complete), so no mutex needed.
+  std::atomic<bool> guard_active_{true};   // start guarded at launch
+  Eigen::Vector3d hold_p_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond hold_q_{Eigen::Quaterniond::Identity()};
+
   std::atomic<bool> running_{true};
   std::thread control_thread_;
 
@@ -503,6 +571,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr desired_pose_pub_;
   rclcpp::Service<franka_cartesian_impedance_msgs::srv::GoToPose>::SharedPtr go_pose_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr go_home_srv_;
+  rclcpp::Publisher<franka_cartesian_impedance_msgs::msg::ControlState>::SharedPtr control_state_pub_;
 };
 
 int main(int argc, char** argv) {
