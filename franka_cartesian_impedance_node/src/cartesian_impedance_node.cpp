@@ -109,7 +109,10 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // Debug: ring buffer of command derivatives; on a reflex the cause is classified and
     // the raw external wrench / joint external torque are logged vs thresholds.
     dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 1000);
-    dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 40);
+    // 250 ms of history: reflex detection -> ControlException propagation can exceed
+    // 40 ms, in which case the offending command predates a short dump window
+    // (observed on hardware: a clean 40-cycle window before a discontinuity reflex).
+    dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 250);
     dbg_.assign(dbg_n_, std::array<double, 13>{});
     // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
     joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
