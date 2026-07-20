@@ -380,15 +380,17 @@ class CartesianImpedanceNode : public rclcpp::Node {
         // homing complete? (close in position + orientation + nearly stopped) -> latch the
         // home as the standing target and signal the waiting service call.
         if (homing) {
-          double perr = (tp - cmd_p).norm();
-          Eigen::Quaterniond dqh = tq * cmd_q.inverse();
+          // completion is measured against the GOAL, not the creeping setpoint (the
+          // setpoint starts AT the command pose -> comparing against it fires instantly)
+          double perr = (goal_p - cmd_p).norm();
+          Eigen::Quaterniond dqh = goal_q * cmd_q.inverse();
           if (dqh.w() < 0) dqh.coeffs() *= -1.0;
           double rerr = 2.0 * std::acos(std::min(1.0, std::abs(dqh.w())));
           if (perr < homing_pos_tol_ && rerr < homing_rot_tol_ && cmd_v.norm() < 0.005) {
             {
               std::lock_guard<std::mutex> lk(target_mtx_);
-              target_p_ = tp;
-              target_q_ = tq;
+              target_p_ = goal_p;
+              target_q_ = goal_q;
               have_target_ = true;
             }
             {
@@ -396,8 +398,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
               homing_active_ = false;
               homing_done_ = true;
             }
-            hold_p_ = tp;            // park here and GUARD until a near target_pose arrives
-            hold_q_ = tq;            // (else teleop's stale equilibrium would yank the arm)
+            hold_p_ = goal_p;        // park here and GUARD until a near target_pose arrives
+            hold_q_ = goal_q;        // (else teleop's stale equilibrium would yank the arm)
             guard_active_ = true;
             homing_cv_.notify_all();
           }
