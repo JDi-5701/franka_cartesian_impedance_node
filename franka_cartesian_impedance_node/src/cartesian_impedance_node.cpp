@@ -158,6 +158,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
       homing_q_ = gq.normalized();
       homing_v_eff_ = v > 0.0 ? v : homing_velocity_;
       homing_done_ = false;
+      homing_fresh_ = true;   // control loop re-seeds the creep setpoint at the cmd pose
       homing_active_ = true;
     }
     RCLCPP_INFO(get_logger(), "homing: to [% .3f % .3f % .3f] @ %.2f m/s",
@@ -228,6 +229,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
       Eigen::Vector3d cmd_v = Eigen::Vector3d::Zero();  // current commanded translational velocity
       Eigen::Quaterniond cmd_q;    // current commanded orientation
       Eigen::Vector3d cmd_w = Eigen::Vector3d::Zero();  // current commanded angular velocity
+      Eigen::Vector3d setp_p = Eigen::Vector3d::Zero();       // homing creep setpoint
+      Eigen::Quaterniond setp_q = Eigen::Quaterniond::Identity();
 
       robot.control([&](const franka::RobotState& state,
                         franka::Duration period) -> franka::CartesianPose {
@@ -260,12 +263,21 @@ class CartesianImpedanceNode : public rclcpp::Node {
         double vcap = max_v_;
         const char* mode_str = "TOPIC";
         bool homing = false;
+        Eigen::Vector3d goal_p;
+        Eigen::Quaterniond goal_q;
+        double homing_v = 0.0;
         {
           std::lock_guard<std::mutex> lk(homing_mtx_);
           homing = homing_active_;
           if (homing) {
-            tp = homing_p_;
-            tq = homing_q_;
+            goal_p = homing_p_;
+            goal_q = homing_q_;
+            homing_v = homing_v_eff_;
+            if (homing_fresh_) {   // new homing request: creep starts at the current command
+              setp_p = cmd_p;
+              setp_q = cmd_q;
+              homing_fresh_ = false;
+            }
             vcap = std::min(max_v_, homing_v_eff_);
           }
         }
@@ -301,6 +313,34 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
         double dt = period.toSec();
         if (dt <= 0.0) dt = 0.001;
+
+        // HOMING setpoint creep: do NOT feed the far goal to the tracking filter directly —
+        // a 0.3 m target jump saturates the accel clamp in one 1ms cycle (accel step ->
+        // *_acceleration_discontinuity reflex). Instead move an internal setpoint toward
+        // the goal at exactly the requested velocity and track THAT: the filter then only
+        // ever sees a millimeter-scale moving target, same as the verified teleop stream.
+        if (homing) {
+          const double step = homing_v * dt;
+          Eigen::Vector3d d = goal_p - setp_p;
+          const double dist = d.norm();
+          Eigen::Quaterniond dqs = goal_q * setp_q.inverse();
+          if (dqs.w() < 0) dqs.coeffs() *= -1.0;
+          const double ang = 2.0 * std::acos(std::min(1.0, std::abs(dqs.w())));
+          if (dist > step) {
+            const double frac = step / dist;      // rotation shares the fraction -> both
+            setp_p += d * frac;                   // translation and rotation arrive together
+            if (ang > 1e-6) setp_q = setp_q.slerp(frac, goal_q);
+          } else {
+            setp_p = goal_p;
+            // residual pure rotation: creep at a slow fixed angular rate
+            const double wstep = std::min(0.3, max_w_) * dt;   // rad per cycle
+            setp_q = (ang <= wstep) ? goal_q
+                                    : setp_q.slerp(wstep / std::max(ang, 1e-9), goal_q);
+          }
+          setp_q.normalize();
+          tp = setp_p;
+          tq = setp_q;
+        }
 
         // Velocity- AND acceleration-limited interpolation toward target (trapezoidal
         // profile). Smooth start/stop -> no velocity/acceleration discontinuity reflex.
@@ -553,6 +593,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
   std::condition_variable homing_cv_;
   bool homing_active_{false};
   bool homing_done_{false};
+  bool homing_fresh_{false};   // set per request; control loop re-seeds the creep setpoint
   Eigen::Vector3d homing_p_{Eigen::Vector3d::Zero()};
   Eigen::Quaterniond homing_q_{Eigen::Quaterniond::Identity()};
   double homing_v_eff_{0.08};
