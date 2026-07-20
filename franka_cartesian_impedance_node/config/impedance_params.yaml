@@ -14,6 +14,11 @@ cartesian_impedance_node:
     max_translational_acceleration: 2.0   # m/s^2
     max_rotational_velocity: 1.0          # rad/s
     max_rotational_acceleration: 2.0      # rad/s^2
+    # Jerk clamps (accel change per cycle). A stepped target >1cm (= max_a/gain, e.g.
+    # 30 Hz pi0.5 targets during fast motion) saturates the accel clamp in one 1ms
+    # cycle -> acceleration_discontinuity reflex. Franka's limit ~4500; stay well under.
+    max_translational_jerk: 1000.0        # m/s^3
+    max_rotational_jerk: 1000.0           # rad/s^3
     # 2nd-order command filter stiffness (higher = snappier; lower = smoother/softer).
     trans_filter_gain: 200.0
     rot_filter_gain: 200.0

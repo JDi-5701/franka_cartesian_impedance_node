@@ -67,6 +67,13 @@ class CartesianImpedanceNode : public rclcpp::Node {
     max_a_ = declare_parameter<double>("max_translational_acceleration", 0.5);  // m/s^2
     max_w_ = declare_parameter<double>("max_rotational_velocity", 0.5);      // rad/s
     max_walpha_ = declare_parameter<double>("max_rotational_acceleration", 5.0);  // rad/s^2
+    // Jerk clamps: bound the CHANGE of the commanded accel per cycle. The amplitude
+    // clamps above do NOT bound jerk: a stepped target (30 Hz policy targets can jump
+    // >1 cm = max_a/gain between messages) saturates the accel clamp in ONE 1ms cycle
+    // -> accel step -> *_acceleration_discontinuity reflex. Franka's own limit is
+    // ~4500 m/s^3; stay well under. Inactive during smooth teleop tracking.
+    max_j_ = declare_parameter<double>("max_translational_jerk", 1000.0);   // m/s^3
+    max_jw_ = declare_parameter<double>("max_rotational_jerk", 1000.0);     // rad/s^3
     // 2nd-order filter stiffness (higher = snappier tracking; damping is auto-critical).
     trans_gain_ = declare_parameter<double>("trans_filter_gain", 100.0);
     rot_gain_ = declare_parameter<double>("rot_filter_gain", 100.0);
@@ -231,6 +238,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
       Eigen::Vector3d cmd_w = Eigen::Vector3d::Zero();  // current commanded angular velocity
       Eigen::Vector3d setp_p = Eigen::Vector3d::Zero();       // homing creep setpoint
       Eigen::Quaterniond setp_q = Eigen::Quaterniond::Identity();
+      Eigen::Vector3d cmd_a = Eigen::Vector3d::Zero();   // last commanded accel (jerk clamp state)
+      Eigen::Vector3d cmd_aw = Eigen::Vector3d::Zero();  // last commanded angular accel
 
       robot.control([&](const franka::RobotState& state,
                         franka::Duration period) -> franka::CartesianPose {
@@ -349,6 +358,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
         double kd_t = 2.0 * std::sqrt(trans_gain_);
         Eigen::Vector3d acc = trans_gain_ * (tp - cmd_p) - kd_t * cmd_v;
         if (acc.norm() > max_a_) acc = acc.normalized() * max_a_;        // accel safety clamp
+        // jerk clamp: a stepped target saturating the accel clamp must ramp over a few
+        // cycles, not step in one (accel step = discontinuity reflex, see param comment)
+        Eigen::Vector3d da = acc - cmd_a;
+        if (da.norm() > max_j_ * dt) acc = cmd_a + da.normalized() * (max_j_ * dt);
+        cmd_a = acc;
         cmd_v += acc * dt;
         // Velocity safety clamp (homing -> slower cap). When the cap SHRINKS mid-motion
         // (TOPIC max_v -> homing_velocity on a go_home/go_pose while the arm still moves),
@@ -369,6 +383,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
         double kd_r = 2.0 * std::sqrt(rot_gain_);
         Eigen::Vector3d ang_acc = rot_gain_ * err_rot - kd_r * cmd_w;
         if (ang_acc.norm() > max_walpha_) ang_acc = ang_acc.normalized() * max_walpha_;
+        Eigen::Vector3d daw = ang_acc - cmd_aw;   // jerk clamp (same as translation)
+        if (daw.norm() > max_jw_ * dt) ang_acc = cmd_aw + daw.normalized() * (max_jw_ * dt);
+        cmd_aw = ang_acc;
         cmd_w += ang_acc * dt;
         if (cmd_w.norm() > max_w_) cmd_w = cmd_w.normalized() * max_w_;
         double wn = cmd_w.norm();
@@ -567,7 +584,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
   std::string robot_ip_;
   std::vector<double> stiffness_;
-  double max_v_, max_a_, max_w_, max_walpha_;
+  double max_v_, max_a_, max_w_, max_walpha_, max_j_, max_jw_;
   double trans_gain_, rot_gain_;
   double coll_torque_, coll_force_, cutoff_hz_;
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
