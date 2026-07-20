@@ -110,7 +110,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // the raw external wrench / joint external torque are logged vs thresholds.
     dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 1000);
     dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 40);
-    dbg_.assign(dbg_n_, std::array<double, 11>{});
+    dbg_.assign(dbg_n_, std::array<double, 13>{});
     // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
     joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
 
@@ -432,18 +432,36 @@ class CartesianImpedanceNode : public rclcpp::Node {
           control_state_pub_->publish(cs);
         }
 
-        // debug: command derivatives (what libfranka's continuity checks see) + raw
-        // signals so a reflex can be attributed to an exact channel.
-        if (!deriv_init_) { prev_cmd_p_ = cmd_p; prev_cmd_v_.setZero(); deriv_init_ = true; }
+        // debug: command derivatives on BOTH channels (what libfranka's continuity
+        // checks see) + raw signals, so a reflex can be attributed to an exact channel.
+        if (!deriv_init_) {
+          prev_cmd_p_ = cmd_p; prev_cmd_v_.setZero();
+          prev_cmd_q_ = cmd_q; prev_cmd_w_.setZero();
+          deriv_init_ = true;
+        }
         Eigen::Vector3d d_v = (cmd_p - prev_cmd_p_) / dt;
         Eigen::Vector3d d_a = (d_v - prev_cmd_v_) / dt;
+        Eigen::Quaterniond dq_dbg = cmd_q * prev_cmd_q_.inverse();
+        if (dq_dbg.w() < 0) dq_dbg.coeffs() *= -1.0;
+        Eigen::AngleAxisd aa_dbg(dq_dbg);
+        Eigen::Vector3d d_w = aa_dbg.angle() * aa_dbg.axis() / dt;   // commanded ang vel
+        Eigen::Vector3d d_alpha = (d_w - prev_cmd_w_) / dt;          // commanded ang accel
         prev_cmd_p_ = cmd_p; prev_cmd_v_ = d_v;
+        prev_cmd_q_ = cmd_q; prev_cmd_w_ = d_w;
+        Eigen::Quaterniond dq_lag = tq * cmd_q.inverse();
+        if (dq_lag.w() < 0) dq_lag.coeffs() *= -1.0;
+        double rot_lag_deg =
+            2.0 * std::acos(std::min(1.0, std::abs(dq_lag.w()))) * 180.0 / M_PI;
         dbg_t_ += dt;
         peak_v_ = std::max(peak_v_, d_v.norm());
         peak_a_ = std::max(peak_a_, d_a.norm());
-        dbg_[dbg_i_] = {dbg_t_, d_v.x(), d_v.y(), d_v.z(), d_a.x(), d_a.y(), d_a.z(),
+        peak_w_ = std::max(peak_w_, d_w.norm());
+        peak_alpha_ = std::max(peak_alpha_, d_alpha.norm());
+        dbg_[dbg_i_] = {dbg_t_, d_v.x(), d_v.y(), d_v.z(), d_a.norm(),
+                       d_w.norm(), d_alpha.norm(),
                        state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
-                       (tp - cmd_p).norm()};
+                       (tp - cmd_p).norm(), rot_lag_deg,
+                       homing ? 1.0 : (guard_active_ ? 2.0 : 0.0)};
         dbg_i_ = (dbg_i_ + 1) % dbg_n_;
         if (dbg_i_ == 0) dbg_full_ = true;
         for (int i = 0; i < 6; ++i) last_wrench_[i] = state.O_F_ext_hat_K[i];
@@ -500,19 +518,24 @@ class CartesianImpedanceNode : public rclcpp::Node {
     RCLCPP_WARN(get_logger(),
                 "  peak cmd |v| = %.3f m/s (Franka cmd limit ~1.7)   |a| = %.1f m/s^2 (~13)",
                 peak_v_, peak_a_);
+    RCLCPP_WARN(get_logger(),
+                "  peak cmd |w| = %.3f rad/s (~2.5)   |alpha| = %.1f rad/s^2 (~25)",
+                peak_w_, peak_alpha_);
   }
 
   void dumpDebug() {
     size_t avail = dbg_full_ ? dbg_n_ : dbg_i_;
     size_t count = std::min(avail, dbg_dump_);
     size_t first = (dbg_i_ + dbg_n_ - count) % dbg_n_;
-    RCLCPP_WARN(get_logger(), "---- last %zu cycles (t | cmd_v | cmd_a | O_F_ext xyz | "
-                "cmd-target lag) ----", count);
+    RCLCPP_WARN(get_logger(), "---- last %zu cycles (t | cmd_v | |a| | |w| |alpha| | "
+                "O_F_ext xyz | pos/rot lag | mode 0=TOPIC 1=HOMING 2=GUARD) ----", count);
     for (size_t k = 0; k < count; ++k) {
       const auto& r = dbg_[(first + k) % dbg_n_];
       RCLCPP_WARN(get_logger(),
-                  "t=%.3f v=[% .3f % .3f % .3f] a=[% 7.1f % 7.1f % 7.1f] F=[% .1f % .1f % .1f] lag=%.3f",
-                  r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
+                  "t=%.3f v=[% .3f % .3f % .3f] |a|=%6.1f |w|=%6.3f |al|=%6.1f "
+                  "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f",
+                  r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                  r[7], r[8], r[9], r[10], r[11], r[12]);
     }
   }
 
@@ -592,13 +615,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
   std::string joint_prefix_;
 
   // debug
-  std::vector<std::array<double, 11>> dbg_;
+  // row: t, dv.xyz, |da|, |w|, |dalpha|, F.xyz, pos_lag, rot_lag_deg, mode(0=TOPIC 1=HOMING 2=GUARD)
+  std::vector<std::array<double, 13>> dbg_;
   size_t dbg_n_{1000}, dbg_i_{0}, dbg_dump_{40};
   bool dbg_full_{false};
   double dbg_t_{0.0};
   Eigen::Vector3d prev_cmd_p_{Eigen::Vector3d::Zero()}, prev_cmd_v_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond prev_cmd_q_{Eigen::Quaterniond::Identity()};
+  Eigen::Vector3d prev_cmd_w_{Eigen::Vector3d::Zero()};
   bool deriv_init_{false};
-  double peak_v_{0.0}, peak_a_{0.0};
+  double peak_v_{0.0}, peak_a_{0.0}, peak_w_{0.0}, peak_alpha_{0.0};
   std::array<double, 6> last_wrench_{};
   std::array<double, 7> last_tau_ext_{};
 
