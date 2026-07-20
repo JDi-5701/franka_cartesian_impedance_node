@@ -310,7 +310,15 @@ class CartesianImpedanceNode : public rclcpp::Node {
         Eigen::Vector3d acc = trans_gain_ * (tp - cmd_p) - kd_t * cmd_v;
         if (acc.norm() > max_a_) acc = acc.normalized() * max_a_;        // accel safety clamp
         cmd_v += acc * dt;
-        if (cmd_v.norm() > vcap) cmd_v = cmd_v.normalized() * vcap;  // velocity safety clamp (homing -> slower)
+        // Velocity safety clamp (homing -> slower cap). When the cap SHRINKS mid-motion
+        // (TOPIC max_v -> homing_velocity on a go_home/go_pose while the arm still moves),
+        // truncating in one 1ms cycle is a velocity step -> discontinuity reflex after the
+        // robot-side IK. Decelerate down to the cap at max_a_ instead.
+        double vn = cmd_v.norm();
+        if (vn > vcap) {
+          double vlim = std::max(vcap, vn - max_a_ * dt);
+          cmd_v *= vlim / vn;
+        }
         cmd_p += cmd_v * dt;
 
         // orientation: velocity- AND acceleration-limited (same scheme as position)
