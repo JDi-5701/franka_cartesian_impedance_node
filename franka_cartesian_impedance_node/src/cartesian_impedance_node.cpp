@@ -146,6 +146,14 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // return -> the robot sees a late/merged cycle -> *_discontinuity reflex.
     state_pub_rate_ = declare_parameter<double>("state_publish_rate", 1000.0);
 
+#ifndef BUILD_VERSION
+#define BUILD_VERSION "unversioned"
+#endif
+    // The compile timestamp is the authoritative part: it changes on every
+    // rebuild even when the CMake configure step (git hash) is skipped.
+    RCLCPP_INFO(get_logger(), "VERSION: %s, compiled %s %s",
+                BUILD_VERSION, __DATE__, __TIME__);
+
     control_thread_ = std::thread(&CartesianImpedanceNode::controlLoop, this);
     pub_thread_ = std::thread(&CartesianImpedanceNode::statePublishLoop, this);
   }
@@ -560,6 +568,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
   //   [ANALYSIS]  this node's interpretation — a guess, can be wrong.
   void reportReflex(const std::string& reason) {
     RCLCPP_ERROR(get_logger(), "================ REFLEX POST-MORTEM ================");
+    RCLCPP_ERROR(get_logger(), "[VERSION] %s, compiled %s %s", BUILD_VERSION, __DATE__, __TIME__);
     RCLCPP_ERROR(get_logger(), "[LIBFRANKA] raw error: %s", reason.c_str());
 
     RCLCPP_WARN(get_logger(), "[DATA] robot state at abort vs OUR collision thresholds:");

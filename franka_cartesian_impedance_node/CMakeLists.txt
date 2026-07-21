@@ -17,6 +17,18 @@ find_package(Franka REQUIRED)
 # can build just the interface to call the services.
 find_package(franka_cartesian_impedance_msgs REQUIRED)
 
+# Bake the git commit + build time into the binary so a running node can always
+# prove which version it is (printed at startup and in every reflex post-mortem).
+execute_process(COMMAND git rev-parse --short HEAD
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT GIT_REV)
+  set(GIT_REV "unknown")
+endif()
+string(TIMESTAMP BUILD_STAMP "%Y-%m-%d %H:%M")
+add_compile_definitions(BUILD_VERSION="${GIT_REV} built ${BUILD_STAMP}")
+
 add_executable(cartesian_impedance_node src/cartesian_impedance_node.cpp)
 target_include_directories(cartesian_impedance_node PRIVATE ${EIGEN3_INCLUDE_DIRS})
 ament_target_dependencies(cartesian_impedance_node
