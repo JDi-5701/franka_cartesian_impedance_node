@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -139,12 +140,19 @@ class CartesianImpedanceNode : public rclcpp::Node {
     control_state_pub_ = create_publisher<franka_cartesian_impedance_msgs::msg::ControlState>(
         "~/control_state", rclcpp::QoS(1).transient_local());
 
+    // State publishing rate (Hz) of the dedicated publisher thread. The 1kHz control
+    // callback must NEVER touch DDS: a stalled publish there delays the command
+    // return -> the robot sees a late/merged cycle -> *_discontinuity reflex.
+    state_pub_rate_ = declare_parameter<double>("state_publish_rate", 1000.0);
+
     control_thread_ = std::thread(&CartesianImpedanceNode::controlLoop, this);
+    pub_thread_ = std::thread(&CartesianImpedanceNode::statePublishLoop, this);
   }
 
   ~CartesianImpedanceNode() override {
     running_ = false;
     if (control_thread_.joinable()) control_thread_.join();
+    if (pub_thread_.joinable()) pub_thread_.join();
   }
 
  private:
@@ -234,7 +242,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
                   robot_ip_.c_str());
 
       bool initialized = false;
-      int status_ctr = 0;          // throttles ~/control_state publishing
       Eigen::Vector3d cmd_p;       // current commanded translation
       Eigen::Vector3d cmd_v = Eigen::Vector3d::Zero();  // current commanded translational velocity
       Eigen::Quaterniond cmd_q;    // current commanded orientation
@@ -258,7 +265,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
           initialized = true;
         }
 
-        publishState(state);
+        // Hand the state to the publisher thread WITHOUT ever blocking: if the
+        // publisher happens to hold the lock (microseconds), skip this snapshot.
+        // No DDS/allocation is allowed in this 1kHz callback (see state_pub_rate_).
+        {
+          std::unique_lock<std::mutex> lk(pub_state_mtx_, std::try_to_lock);
+          if (lk.owns_lock()) {
+            pub_state_ = state;
+            pub_state_fresh_ = true;
+          }
+        }
 
         // measured pose (for the GUARD gap check + status)
         Eigen::Vector3d meas_p;
@@ -273,7 +289,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
         Eigen::Vector3d tp;
         Eigen::Quaterniond tq;
         double vcap = max_v_;
-        const char* mode_str = "TOPIC";
         bool homing = false;
         Eigen::Vector3d goal_p;
         Eigen::Quaterniond goal_q;
@@ -304,9 +319,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
           if (dqt.w() < 0) dqt.coeffs() *= -1.0;
           tgt_rot_err = 2.0 * std::acos(std::min(1.0, std::abs(dqt.w())));
         }
-        if (homing) {
-          mode_str = "HOMING";
-        } else if (guard_active_) {
+        if (!homing && guard_active_) {
           // release the guard once a fresh target is close enough to the current pose
           if (has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
             guard_active_ = false;
@@ -316,7 +329,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
         if (!homing && guard_active_) {
           tp = hold_p_;             // hold the parked pose; ignore target_pose
           tq = hold_q_;
-          mode_str = "GUARD";
         } else if (!homing) {
           std::lock_guard<std::mutex> lk(target_mtx_);
           tp = target_p_;
@@ -425,15 +437,10 @@ class CartesianImpedanceNode : public rclcpp::Node {
           }
         }
 
-        // publish advisory control-mode status at ~20 Hz (state + gap to the latest target).
-        if (++status_ctr >= 50) {
-          status_ctr = 0;
-          franka_cartesian_impedance_msgs::msg::ControlState cs;
-          cs.state = mode_str;
-          cs.position_error = tgt_pos_err;
-          cs.orientation_error = tgt_rot_err * 180.0 / M_PI;
-          control_state_pub_->publish(cs);
-        }
+        // control-mode status for the publisher thread (atomics: no DDS from here).
+        cs_mode_.store(homing ? 1 : (guard_active_ ? 2 : 0), std::memory_order_relaxed);
+        cs_pos_err_.store(tgt_pos_err, std::memory_order_relaxed);
+        cs_rot_err_.store(tgt_rot_err, std::memory_order_relaxed);
 
         // debug: command derivatives on BOTH channels (what libfranka's continuity
         // checks see) + raw signals, so a reflex can be attributed to an exact channel.
@@ -637,6 +644,45 @@ class CartesianImpedanceNode : public rclcpp::Node {
     desired_pose_pub_->publish(pds);
   }
 
+  // Dedicated publisher thread: ALL DDS traffic to downstream (5090 PC etc.)
+  // happens here, decoupled from the 1kHz control callback. If DDS stalls,
+  // this thread lags; the control loop keeps answering the robot on time.
+  void statePublishLoop() {
+    const auto period = std::chrono::microseconds(
+        (int64_t)(1e6 / std::max(1.0, state_pub_rate_)));
+    auto next = std::chrono::steady_clock::now();
+    int status_ctr = 0;
+    while (running_ && rclcpp::ok()) {
+      next += period;
+      std::this_thread::sleep_until(next);
+      franka::RobotState s;
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lk(pub_state_mtx_);
+        if (pub_state_fresh_) {
+          s = pub_state_;
+          pub_state_fresh_ = false;
+          fresh = true;
+        }
+      }
+      if (fresh) publishState(s);
+      // advisory control-mode status at ~1/50 of the state rate (20 Hz at 1kHz)
+      if (++status_ctr >= 50) {
+        status_ctr = 0;
+        static const char* kModes[3] = {"TOPIC", "HOMING", "GUARD"};
+        franka_cartesian_impedance_msgs::msg::ControlState cs;
+        cs.state = kModes[std::clamp(cs_mode_.load(std::memory_order_relaxed), 0, 2)];
+        cs.position_error = cs_pos_err_.load(std::memory_order_relaxed);
+        cs.orientation_error =
+            cs_rot_err_.load(std::memory_order_relaxed) * 180.0 / M_PI;
+        control_state_pub_->publish(cs);
+      }
+      // after a long DDS stall don't burst-catch-up; just resynchronize
+      if (next < std::chrono::steady_clock::now() - std::chrono::milliseconds(100))
+        next = std::chrono::steady_clock::now();
+    }
+  }
+
   std::string robot_ip_;
   std::vector<double> stiffness_;
   double max_v_, max_a_, max_w_, max_walpha_, max_j_, max_jw_;
@@ -693,6 +739,15 @@ class CartesianImpedanceNode : public rclcpp::Node {
   Eigen::Quaterniond hold_q_{Eigen::Quaterniond::Identity()};
 
   std::atomic<bool> running_{true};
+
+  // 1kHz-callback -> publisher-thread hand-off (see statePublishLoop)
+  double state_pub_rate_{1000.0};
+  std::thread pub_thread_;
+  std::mutex pub_state_mtx_;
+  franka::RobotState pub_state_{};
+  bool pub_state_fresh_{false};
+  std::atomic<int> cs_mode_{2};                 // 0=TOPIC 1=HOMING 2=GUARD
+  std::atomic<double> cs_pos_err_{0.0}, cs_rot_err_{0.0};
   std::thread control_thread_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
