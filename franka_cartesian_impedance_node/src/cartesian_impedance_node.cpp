@@ -109,12 +109,13 @@ class CartesianImpedanceNode : public rclcpp::Node {
     }
     // Debug: ring buffer of command derivatives; on a reflex the cause is classified and
     // the raw external wrench / joint external torque are logged vs thresholds.
-    dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 1000);
-    // 250 ms of history: reflex detection -> ControlException propagation can exceed
-    // 40 ms, in which case the offending command predates a short dump window
-    // (observed on hardware: a clean 40-cycle window before a discontinuity reflex).
-    dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 250);
-    dbg_.assign(dbg_n_, std::array<double, 17>{});
+    // 5 s of history dumped in full: short runs die ~2 s in, and the interesting
+    // events (IK spikes, sr dips) sit SECONDS before the abort, far outside a
+    // 250 ms window. The dump goes to the log file; marked rows (<== flags) are
+    // extracted with grep, so its length costs nothing.
+    dbg_n_ = (size_t)declare_parameter<int>("debug_buffer_samples", 5000);
+    dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 5000);
+    dbg_.assign(dbg_n_, std::array<double, 18>{});
     // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
     joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
 
@@ -157,10 +158,26 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
  private:
   void targetCb(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+    Eigen::Vector3d p(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    Eigen::Quaterniond q(msg->pose.orientation.w, msg->pose.orientation.x,
+                         msg->pose.orientation.y, msg->pose.orientation.z);
+    // Monitor the RAW incoming target stream: step size between consecutive
+    // targets, position and rotation separately. A jump here is upstream
+    // (deploy node / teleop), before any smoothing of ours.
+    if (have_last_raw_) {
+      double dp = (p - last_raw_p_).norm();
+      Eigen::Quaterniond dq = q * last_raw_q_.inverse();
+      if (dq.w() < 0) dq.coeffs() *= -1.0;
+      double dr = 2.0 * std::acos(std::min(1.0, std::abs(dq.w()))) * 180.0 / M_PI;
+      if (dp > peak_tgt_step_pos_) { peak_tgt_step_pos_ = dp; peak_tgt_step_pos_t_ = dbg_t_; }
+      if (dr > peak_tgt_step_rot_) { peak_tgt_step_rot_ = dr; peak_tgt_step_rot_t_ = dbg_t_; }
+    }
+    last_raw_p_ = p;
+    last_raw_q_ = q;
+    have_last_raw_ = true;
     std::lock_guard<std::mutex> lk(target_mtx_);
-    target_p_ = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-    target_q_ = Eigen::Quaterniond(msg->pose.orientation.w, msg->pose.orientation.x,
-                                   msg->pose.orientation.y, msg->pose.orientation.z);
+    target_p_ = p;
+    target_q_ = q;
     have_target_ = true;
   }
 
@@ -467,6 +484,20 @@ class CartesianImpedanceNode : public rclcpp::Node {
         peak_a_ = std::max(peak_a_, d_a.norm());
         peak_w_ = std::max(peak_w_, d_w.norm());
         peak_alpha_ = std::max(peak_alpha_, d_alpha.norm());
+        // WALL-CLOCK spacing of this callback (steady_clock). The robot-reported
+        // `period` is robot-time between states and stays 1.0 ms even when WE are
+        // stalled (delayed states get processed back to back); this one does not.
+        const auto tp_now = std::chrono::steady_clock::now();
+        double wall_ms = 1.0;
+        if (cb_tp_valid_)
+          wall_ms = std::chrono::duration<double, std::milli>(tp_now - prev_cb_tp_).count();
+        prev_cb_tp_ = tp_now;
+        cb_tp_valid_ = true;
+        if (wall_ms > 1.5) {
+          ++n_wall_late_;
+          worst_wall_ms_ = std::max(worst_wall_ms_, wall_ms);
+          last_wall_late_t_ = dbg_t_;
+        }
         const double period_ms = period.toSec() * 1000.0;
         const double succ = state.control_command_success_rate;
         // Robot-side IK output (desired JOINT trajectory the robot derived from our
@@ -501,7 +532,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
                        state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
                        (tp - cmd_p).norm(), rot_lag_deg,
                        homing ? 1.0 : (guard_active_ ? 2.0 : 0.0),
-                       period_ms, succ, max_dq, max_ddq};
+                       period_ms, succ, max_dq, max_ddq, wall_ms};
         dbg_i_ = (dbg_i_ + 1) % dbg_n_;
         if (dbg_i_ == 0) dbg_full_ = true;
         for (int i = 0; i < 6; ++i) last_wrench_[i] = state.O_F_ext_hat_K[i];
@@ -562,29 +593,41 @@ class CartesianImpedanceNode : public rclcpp::Node {
                 "|ddq_d| %.1f rad/s^2 on J%d at t=%.3f s (limits ~10-15; spikes here with "
                 "smooth Cartesian commands = near-singularity IK)",
                 peak_dq_, peak_ddq_, peak_ddq_joint_, peak_ddq_t_);
+    RCLCPP_WARN(get_logger(),
+                "[DATA] OUR callback wall-clock spacing: %lu cycles later than 1.5 ms "
+                "(worst %.1f ms, last at t=%.3f s) — this DOES catch NUC-side stalls "
+                "that the robot-reported period cannot see",
+                n_wall_late_, worst_wall_ms_, last_wall_late_t_);
+    RCLCPP_WARN(get_logger(),
+                "[DATA] RAW target topic steps (upstream, before our smoothing): peak "
+                "position step %.1f mm at t=%.3f s, peak rotation step %.1f deg at "
+                "t=%.3f s (10 Hz stream: normal step = speed/10)",
+                peak_tgt_step_pos_ * 1000.0, peak_tgt_step_pos_t_,
+                peak_tgt_step_rot_, peak_tgt_step_rot_t_);
 
     std::string cls;
     if (reason.find("discontinuity") != std::string::npos) {
-      bool timing_bad = n_long_cycles_ > 0 || min_success_ < 0.995;
-      bool cmd_hot = peak_a_ > 10.0 || peak_alpha_ > 20.0 || peak_v_ > 1.5 || peak_w_ > 2.0;
-      bool joint_only = reason.find("joint") != std::string::npos &&
-                        reason.find("cartesian_motion_generator_velocity") == std::string::npos &&
-                        reason.find("cartesian_motion_generator_acceleration") == std::string::npos;
-      if (joint_only && !cmd_hot && peak_ddq_ > 10.0)
-        cls = "JOINT-space discontinuity with smooth Cartesian commands and a joint "
-              "accel spike in the robot's own IK output -> near-singularity / workspace-"
-              "edge configuration, a robot-side geometry problem. Fix: keep the task "
-              "path away from stretched-arm / aligned-wrist poses.";
-      else if (timing_bad && !cmd_hot)
-        cls = "discontinuity reported but OUR commands stayed far below the limits AND "
-              "cycles were late -> late/lost 1kHz commands (RT jitter / DDS stall), "
-              "not command content.";
-      else if (cmd_hot)
-        cls = "OUR command stream was too jerky (see peaks above). Fix: lower "
-              "trans/rot_filter_gain, raise command_cutoff_hz, slower targets.";
+      // List EVERY indicator that fired instead of picking the first match —
+      // several can be true at once and choosing one earlier hid real findings.
+      std::string findings;
+      if (peak_a_ > 10.0 || peak_alpha_ > 20.0 || peak_v_ > 1.5 || peak_w_ > 2.0)
+        findings += " [cmd] our Cartesian command stream itself got jerky (see peaks).";
+      if (n_wall_late_ > 0)
+        findings += " [nuc] our callback ran late on the NUC (wall-clock, see [DATA]) "
+                    "-> commands left late.";
+      if (min_success_ < 0.995)
+        findings += " [net] the robot reported late/lost commands (success_rate dips, "
+                    "see history times).";
+      if (peak_ddq_ > 10.0)
+        findings += " [ik] the robot's own IK output spiked (|ddq_d|) with our Cartesian "
+                    "commands smooth -> near-singularity / workspace-edge geometry.";
+      if (findings.empty())
+        cls = "discontinuity, but none of our indicators fired — check the per-cycle "
+              "dump around the abort.";
       else
-        cls = "discontinuity, but our commands look clean and no late cycle was seen — "
-              "check the per-cycle dump below around the abort.";
+        cls = "indicators that fired:" + findings +
+              " NOTE: which one CAUSED the abort is decided by the dump timeline, "
+              "not by this list.";
     } else if (reason.find("velocity_violation") != std::string::npos ||
                reason.find("velocity_limit") != std::string::npos) {
       cls = "a JOINT exceeded its speed limit (near singularity / workspace edge, or "
@@ -613,12 +656,14 @@ class CartesianImpedanceNode : public rclcpp::Node {
       RCLCPP_WARN(get_logger(),
                   "t=%.3f v=[% .3f % .3f % .3f] |a|=%6.1f |w|=%6.3f |al|=%6.1f "
                   "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f dt=%.1f sr=%.2f "
-                  "dq=%.2f ddq=%5.1f%s%s",
+                  "dq=%.2f ddq=%5.1f wt=%.1f%s%s%s%s",
                   r[0], r[1], r[2], r[3], r[4], r[5], r[6],
                   r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14],
-                  r[15], r[16],
+                  r[15], r[16], r[17],
                   r[13] > 1.5 ? "   <== MISSED CYCLE" : "",
-                  r[16] > 10.0 ? "   <== JOINT ACCEL SPIKE" : "");
+                  r[16] > 10.0 ? "   <== JOINT ACCEL SPIKE" : "",
+                  r[17] > 1.5 ? "   <== CALLBACK DELAYED (our side)" : "",
+                  r[14] < 0.999 ? "   <== SR DEGRADED" : "");
     }
   }
 
@@ -738,8 +783,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
   // debug
   // row: t, dv.xyz, |da|, |w|, |dalpha|, F.xyz, pos_lag, rot_lag_deg, mode(0=TOPIC 1=HOMING 2=GUARD),
-  //      period_ms, control_command_success_rate, max|dq_d|, max|ddq_d| (robot IK output)
-  std::vector<std::array<double, 17>> dbg_;
+  //      period_ms, control_command_success_rate, max|dq_d|, max|ddq_d| (robot IK output),
+  //      wall_ms (steady_clock spacing of OUR callback)
+  std::vector<std::array<double, 18>> dbg_;
   size_t dbg_n_{1000}, dbg_i_{0}, dbg_dump_{40};
   bool dbg_full_{false};
   double dbg_t_{0.0};
@@ -757,6 +803,17 @@ class CartesianImpedanceNode : public rclcpp::Node {
   // robot-side IK output peaks (joint-space desired trajectory)
   double peak_dq_{0.0}, peak_ddq_{0.0}, peak_ddq_t_{0.0};
   int peak_ddq_joint_{0};
+  // wall-clock callback spacing (our-side delay detector)
+  std::chrono::steady_clock::time_point prev_cb_tp_;
+  bool cb_tp_valid_{false};
+  double worst_wall_ms_{0.0}, last_wall_late_t_{0.0};
+  unsigned long n_wall_late_{0};
+  // raw incoming target stream monitor (written by the subscriber thread)
+  bool have_last_raw_{false};
+  Eigen::Vector3d last_raw_p_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond last_raw_q_{Eigen::Quaterniond::Identity()};
+  double peak_tgt_step_pos_{0.0}, peak_tgt_step_pos_t_{0.0};
+  double peak_tgt_step_rot_{0.0}, peak_tgt_step_rot_t_{0.0};
   std::array<double, 6> last_wrench_{};
   std::array<double, 7> last_tau_ext_{};
 
