@@ -114,7 +114,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // 40 ms, in which case the offending command predates a short dump window
     // (observed on hardware: a clean 40-cycle window before a discontinuity reflex).
     dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 250);
-    dbg_.assign(dbg_n_, std::array<double, 15>{});
+    dbg_.assign(dbg_n_, std::array<double, 17>{});
     // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
     joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
 
@@ -469,6 +469,21 @@ class CartesianImpedanceNode : public rclcpp::Node {
         peak_alpha_ = std::max(peak_alpha_, d_alpha.norm());
         const double period_ms = period.toSec() * 1000.0;
         const double succ = state.control_command_success_rate;
+        // Robot-side IK output (desired JOINT trajectory the robot derived from our
+        // Cartesian commands): near a singularity a smooth Cartesian step explodes
+        // here — exactly what a joint_*_discontinuity reflex complains about.
+        double max_dq = 0.0, max_ddq = 0.0;
+        int worst_j = 0;
+        for (int i = 0; i < 7; ++i) {
+          max_dq = std::max(max_dq, std::abs(state.dq_d[i]));
+          if (std::abs(state.ddq_d[i]) > max_ddq) {
+            max_ddq = std::abs(state.ddq_d[i]);
+            worst_j = i + 1;
+          }
+        }
+        if (max_ddq > peak_ddq_) { peak_ddq_ = max_ddq; peak_ddq_joint_ = worst_j;
+                                   peak_ddq_t_ = dbg_t_; }
+        peak_dq_ = std::max(peak_dq_, max_dq);
         if (n_cycles_++ > 0) {          // first callback reports period 0
           worst_period_ms_ = std::max(worst_period_ms_, period_ms);
           if (period_ms > 1.5) ++n_long_cycles_;
@@ -486,7 +501,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
                        state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
                        (tp - cmd_p).norm(), rot_lag_deg,
                        homing ? 1.0 : (guard_active_ ? 2.0 : 0.0),
-                       period_ms, succ};
+                       period_ms, succ, max_dq, max_ddq};
         dbg_i_ = (dbg_i_ + 1) % dbg_n_;
         if (dbg_i_ == 0) dbg_full_ = true;
         for (int i = 0; i < 6; ++i) last_wrench_[i] = state.O_F_ext_hat_K[i];
@@ -541,12 +556,26 @@ class CartesianImpedanceNode : public rclcpp::Node {
                 "(<0.999), last one at t=%.3f s; the abort was at t=%.3f s "
                 "(t counts from control start; sr is a 100-cycle trailing average)",
                 min_success_t_, n_degraded_, last_degraded_t_, dbg_t_);
+    RCLCPP_WARN(get_logger(),
+                "[DATA] robot IK output (joint-space desired traj the robot computed from "
+                "our Cartesian commands): peak |dq_d| %.2f rad/s (limits ~2.1-2.6), peak "
+                "|ddq_d| %.1f rad/s^2 on J%d at t=%.3f s (limits ~10-15; spikes here with "
+                "smooth Cartesian commands = near-singularity IK)",
+                peak_dq_, peak_ddq_, peak_ddq_joint_, peak_ddq_t_);
 
     std::string cls;
     if (reason.find("discontinuity") != std::string::npos) {
       bool timing_bad = n_long_cycles_ > 0 || min_success_ < 0.995;
       bool cmd_hot = peak_a_ > 10.0 || peak_alpha_ > 20.0 || peak_v_ > 1.5 || peak_w_ > 2.0;
-      if (timing_bad && !cmd_hot)
+      bool joint_only = reason.find("joint") != std::string::npos &&
+                        reason.find("cartesian_motion_generator_velocity") == std::string::npos &&
+                        reason.find("cartesian_motion_generator_acceleration") == std::string::npos;
+      if (joint_only && !cmd_hot && peak_ddq_ > 10.0)
+        cls = "JOINT-space discontinuity with smooth Cartesian commands and a joint "
+              "accel spike in the robot's own IK output -> near-singularity / workspace-"
+              "edge configuration, a robot-side geometry problem. Fix: keep the task "
+              "path away from stretched-arm / aligned-wrist poses.";
+      else if (timing_bad && !cmd_hot)
         cls = "discontinuity reported but OUR commands stayed far below the limits AND "
               "cycles were late -> late/lost 1kHz commands (RT jitter / DDS stall), "
               "not command content.";
@@ -583,10 +612,13 @@ class CartesianImpedanceNode : public rclcpp::Node {
       const auto& r = dbg_[(first + k) % dbg_n_];
       RCLCPP_WARN(get_logger(),
                   "t=%.3f v=[% .3f % .3f % .3f] |a|=%6.1f |w|=%6.3f |al|=%6.1f "
-                  "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f dt=%.1f sr=%.2f%s",
+                  "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f dt=%.1f sr=%.2f "
+                  "dq=%.2f ddq=%5.1f%s%s",
                   r[0], r[1], r[2], r[3], r[4], r[5], r[6],
                   r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14],
-                  r[13] > 1.5 ? "   <== MISSED CYCLE" : "");
+                  r[15], r[16],
+                  r[13] > 1.5 ? "   <== MISSED CYCLE" : "",
+                  r[16] > 10.0 ? "   <== JOINT ACCEL SPIKE" : "");
     }
   }
 
@@ -706,8 +738,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
   // debug
   // row: t, dv.xyz, |da|, |w|, |dalpha|, F.xyz, pos_lag, rot_lag_deg, mode(0=TOPIC 1=HOMING 2=GUARD),
-  //      period_ms, control_command_success_rate
-  std::vector<std::array<double, 15>> dbg_;
+  //      period_ms, control_command_success_rate, max|dq_d|, max|ddq_d| (robot IK output)
+  std::vector<std::array<double, 17>> dbg_;
   size_t dbg_n_{1000}, dbg_i_{0}, dbg_dump_{40};
   bool dbg_full_{false};
   double dbg_t_{0.0};
@@ -722,6 +754,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double worst_period_ms_{0.0}, min_success_{1.0};
   double min_success_t_{0.0}, last_degraded_t_{0.0};
   unsigned long n_long_cycles_{0}, n_cycles_{0}, n_degraded_{0};
+  // robot-side IK output peaks (joint-space desired trajectory)
+  double peak_dq_{0.0}, peak_ddq_{0.0}, peak_ddq_t_{0.0};
+  int peak_ddq_joint_{0};
   std::array<double, 6> last_wrench_{};
   std::array<double, 7> last_tau_ext_{};
 
