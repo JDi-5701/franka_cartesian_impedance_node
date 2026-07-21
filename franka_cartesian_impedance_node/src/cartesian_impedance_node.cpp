@@ -113,7 +113,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // 40 ms, in which case the offending command predates a short dump window
     // (observed on hardware: a clean 40-cycle window before a discontinuity reflex).
     dbg_dump_ = (size_t)declare_parameter<int>("debug_dump_samples", 250);
-    dbg_.assign(dbg_n_, std::array<double, 13>{});
+    dbg_.assign(dbg_n_, std::array<double, 15>{});
     // Joint name prefix for ~/joint_states (fr3_joint1..7); matches admittance_node.
     joint_prefix_ = declare_parameter<std::string>("joint_prefix", "fr3_joint");
 
