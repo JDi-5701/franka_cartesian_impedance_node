@@ -494,49 +494,63 @@ class CartesianImpedanceNode : public rclcpp::Node {
     running_ = false;
   }
 
-  // Attribute a reflex to an exact channel: classify the cause, then print the raw
-  // external wrench and joint external torque vs the configured thresholds.
+  // Reflex post-mortem in three clearly separated sections:
+  //   [LIBFRANKA] verbatim error text from the robot — the ground truth.
+  //   [DATA]      values recorded by THIS node (robot state + our command stream).
+  //   [ANALYSIS]  this node's interpretation — a guess, can be wrong.
   void reportReflex(const std::string& reason) {
-    RCLCPP_ERROR(get_logger(), "==== REFLEX: %s ====", reason.c_str());
-    std::string cls;
-    if (reason.find("discontinuity") != std::string::npos)
-      cls = "COMMAND DISCONTINUITY -> Franka command-rate limit, our command too jerky. "
-            "Fix: lower trans/rot_filter_gain, raise command_cutoff_hz, slower target.";
-    else if (reason.find("velocity_violation") != std::string::npos ||
-             reason.find("velocity_limit") != std::string::npos)
-      cls = "JOINT VELOCITY LIMIT -> a joint exceeded its max speed (near singularity / "
-            "workspace edge, or commanded too fast). Fix: lower max_translational_velocity, "
-            "stay away from singularities.";
-    else if (reason.find("_reflex") != std::string::npos)
-      cls = "COLLISION -> exceeded YOUR collision_*_threshold (see channels below).";
-    else if (reason.find("limit") != std::string::npos || reason.find("violation") != std::string::npos)
-      cls = "LIMIT -> Franka hardware limit (joint position/torque/singularity).";
-    else
-      cls = "OTHER -> see message above.";
-    RCLCPP_ERROR(get_logger(), "CLASS: %s", cls.c_str());
+    RCLCPP_ERROR(get_logger(), "================ REFLEX POST-MORTEM ================");
+    RCLCPP_ERROR(get_logger(), "[LIBFRANKA] raw error: %s", reason.c_str());
 
+    RCLCPP_WARN(get_logger(), "[DATA] robot state at abort vs OUR collision thresholds:");
     const char* wn[6] = {"Fx[N]", "Fy[N]", "Fz[N]", "Tx[Nm]", "Ty[Nm]", "Tz[Nm]"};
     for (int i = 0; i < 6; ++i) {
       bool hit = std::abs(last_wrench_[i]) > coll_force_;
-      RCLCPP_WARN(get_logger(), "  O_F_ext %-6s = % 7.2f   (thr %.1f)%s",
+      RCLCPP_WARN(get_logger(), "[DATA]   O_F_ext %-6s = % 7.2f   (thr %.1f)%s",
                   wn[i], last_wrench_[i], coll_force_, hit ? "   <== EXCEEDED" : "");
     }
     for (int j = 0; j < 7; ++j) {
       bool hit = std::abs(last_tau_ext_[j]) > coll_torque_;
-      RCLCPP_WARN(get_logger(), "  tau_ext J%d   = % 7.2f   (thr %.1f)%s",
+      RCLCPP_WARN(get_logger(), "[DATA]   tau_ext J%d   = % 7.2f   (thr %.1f)%s",
                   j + 1, last_tau_ext_[j], coll_torque_, hit ? "   <== EXCEEDED" : "");
     }
     RCLCPP_WARN(get_logger(),
-                "  peak cmd |v| = %.3f m/s (Franka cmd limit ~1.7)   |a| = %.1f m/s^2 (~13)",
-                peak_v_, peak_a_);
+                "[DATA] peak of OUR commands this run: |v|=%.3f m/s (limit ~1.7)  "
+                "|a|=%.1f m/s^2 (~13)  |w|=%.3f rad/s (~2.5)  |alpha|=%.1f rad/s^2 (~25)",
+                peak_v_, peak_a_, peak_w_, peak_alpha_);
     RCLCPP_WARN(get_logger(),
-                "  peak cmd |w| = %.3f rad/s (~2.5)   |alpha| = %.1f rad/s^2 (~25)",
-                peak_w_, peak_alpha_);
-    RCLCPP_WARN(get_logger(),
-                "  1kHz timing: %lu/%lu cycles with period>1.5ms (worst %.1f ms), "
-                "min success_rate %.2f  [any of these bad + clean cmd derivatives "
-                "= late/lost commands (RT jitter / DDS stall), NOT command content]",
+                "[DATA] 1kHz timing this run: %lu/%lu cycles period>1.5ms (worst %.1f ms), "
+                "min success_rate %.2f (1.00 = no command arrived late)",
                 n_long_cycles_, n_cycles_, worst_period_ms_, min_success_);
+
+    std::string cls;
+    if (reason.find("discontinuity") != std::string::npos) {
+      bool timing_bad = n_long_cycles_ > 0 || min_success_ < 0.995;
+      bool cmd_hot = peak_a_ > 10.0 || peak_alpha_ > 20.0 || peak_v_ > 1.5 || peak_w_ > 2.0;
+      if (timing_bad && !cmd_hot)
+        cls = "discontinuity reported but OUR commands stayed far below the limits AND "
+              "cycles were late -> late/lost 1kHz commands (RT jitter / DDS stall), "
+              "not command content.";
+      else if (cmd_hot)
+        cls = "OUR command stream was too jerky (see peaks above). Fix: lower "
+              "trans/rot_filter_gain, raise command_cutoff_hz, slower targets.";
+      else
+        cls = "discontinuity, but our commands look clean and no late cycle was seen — "
+              "check the per-cycle dump below around the abort.";
+    } else if (reason.find("velocity_violation") != std::string::npos ||
+               reason.find("velocity_limit") != std::string::npos) {
+      cls = "a JOINT exceeded its speed limit (near singularity / workspace edge, or "
+            "commanded too fast). Fix: lower max_translational_velocity, avoid singularities.";
+    } else if (reason.find("_reflex") != std::string::npos) {
+      cls = "contact force exceeded OUR collision_*_threshold (see [DATA] channels).";
+    } else if (reason.find("limit") != std::string::npos ||
+               reason.find("violation") != std::string::npos) {
+      cls = "a Franka hardware limit (joint position/torque/singularity).";
+    } else {
+      cls = "no classification — read the [LIBFRANKA] line; \"Move command aborted!\" "
+            "alone usually means an external stop (Desk / user stop / previous reflex).";
+    }
+    RCLCPP_ERROR(get_logger(), "[ANALYSIS] (our guess, not libfranka): %s", cls.c_str());
   }
 
   void dumpDebug() {
