@@ -460,11 +460,19 @@ class CartesianImpedanceNode : public rclcpp::Node {
         peak_a_ = std::max(peak_a_, d_a.norm());
         peak_w_ = std::max(peak_w_, d_w.norm());
         peak_alpha_ = std::max(peak_alpha_, d_alpha.norm());
+        const double period_ms = period.toSec() * 1000.0;
+        const double succ = state.control_command_success_rate;
+        if (n_cycles_++ > 0) {          // first callback reports period 0
+          worst_period_ms_ = std::max(worst_period_ms_, period_ms);
+          if (period_ms > 1.5) ++n_long_cycles_;
+          min_success_ = std::min(min_success_, succ);
+        }
         dbg_[dbg_i_] = {dbg_t_, d_v.x(), d_v.y(), d_v.z(), d_a.norm(),
                        d_w.norm(), d_alpha.norm(),
                        state.O_F_ext_hat_K[0], state.O_F_ext_hat_K[1], state.O_F_ext_hat_K[2],
                        (tp - cmd_p).norm(), rot_lag_deg,
-                       homing ? 1.0 : (guard_active_ ? 2.0 : 0.0)};
+                       homing ? 1.0 : (guard_active_ ? 2.0 : 0.0),
+                       period_ms, succ};
         dbg_i_ = (dbg_i_ + 1) % dbg_n_;
         if (dbg_i_ == 0) dbg_full_ = true;
         for (int i = 0; i < 6; ++i) last_wrench_[i] = state.O_F_ext_hat_K[i];
@@ -524,6 +532,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
     RCLCPP_WARN(get_logger(),
                 "  peak cmd |w| = %.3f rad/s (~2.5)   |alpha| = %.1f rad/s^2 (~25)",
                 peak_w_, peak_alpha_);
+    RCLCPP_WARN(get_logger(),
+                "  1kHz timing: %lu/%lu cycles with period>1.5ms (worst %.1f ms), "
+                "min success_rate %.2f  [any of these bad + clean cmd derivatives "
+                "= late/lost commands (RT jitter / DDS stall), NOT command content]",
+                n_long_cycles_, n_cycles_, worst_period_ms_, min_success_);
   }
 
   void dumpDebug() {
@@ -531,14 +544,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
     size_t count = std::min(avail, dbg_dump_);
     size_t first = (dbg_i_ + dbg_n_ - count) % dbg_n_;
     RCLCPP_WARN(get_logger(), "---- last %zu cycles (t | cmd_v | |a| | |w| |alpha| | "
-                "O_F_ext xyz | pos/rot lag | mode 0=TOPIC 1=HOMING 2=GUARD) ----", count);
+                "O_F_ext xyz | pos/rot lag | mode 0=TOPIC 1=HOMING 2=GUARD | "
+                "period ms | success_rate) ----", count);
     for (size_t k = 0; k < count; ++k) {
       const auto& r = dbg_[(first + k) % dbg_n_];
       RCLCPP_WARN(get_logger(),
                   "t=%.3f v=[% .3f % .3f % .3f] |a|=%6.1f |w|=%6.3f |al|=%6.1f "
-                  "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f",
+                  "F=[% .1f % .1f % .1f] lag=%.3f/%5.1fdeg m=%.0f dt=%.1f sr=%.2f%s",
                   r[0], r[1], r[2], r[3], r[4], r[5], r[6],
-                  r[7], r[8], r[9], r[10], r[11], r[12]);
+                  r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14],
+                  r[13] > 1.5 ? "   <== MISSED CYCLE" : "");
     }
   }
 
@@ -618,8 +633,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
   std::string joint_prefix_;
 
   // debug
-  // row: t, dv.xyz, |da|, |w|, |dalpha|, F.xyz, pos_lag, rot_lag_deg, mode(0=TOPIC 1=HOMING 2=GUARD)
-  std::vector<std::array<double, 13>> dbg_;
+  // row: t, dv.xyz, |da|, |w|, |dalpha|, F.xyz, pos_lag, rot_lag_deg, mode(0=TOPIC 1=HOMING 2=GUARD),
+  //      period_ms, control_command_success_rate
+  std::vector<std::array<double, 15>> dbg_;
   size_t dbg_n_{1000}, dbg_i_{0}, dbg_dump_{40};
   bool dbg_full_{false};
   double dbg_t_{0.0};
@@ -628,6 +644,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
   Eigen::Vector3d prev_cmd_w_{Eigen::Vector3d::Zero()};
   bool deriv_init_{false};
   double peak_v_{0.0}, peak_a_{0.0}, peak_w_{0.0}, peak_alpha_{0.0};
+  // 1kHz timing health: robot-reported period (1ms nominal; >1ms = a missed cycle,
+  // the command WE returned arrived late) + control_command_success_rate (share of
+  // the last 100 commands the robot actually received in time).
+  double worst_period_ms_{0.0}, min_success_{1.0};
+  unsigned long n_long_cycles_{0}, n_cycles_{0};
   std::array<double, 6> last_wrench_{};
   std::array<double, 7> last_tau_ext_{};
 
