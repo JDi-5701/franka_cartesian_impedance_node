@@ -472,7 +472,14 @@ class CartesianImpedanceNode : public rclcpp::Node {
         if (n_cycles_++ > 0) {          // first callback reports period 0
           worst_period_ms_ = std::max(worst_period_ms_, period_ms);
           if (period_ms > 1.5) ++n_long_cycles_;
-          min_success_ = std::min(min_success_, succ);
+          if (succ < min_success_) {
+            min_success_ = succ;
+            min_success_t_ = dbg_t_;    // WHEN the worst packet loss happened
+          }
+          if (succ < 0.999) {
+            ++n_degraded_;
+            last_degraded_t_ = dbg_t_;  // last cycle with any late command
+          }
         }
         dbg_[dbg_i_] = {dbg_t_, d_v.x(), d_v.y(), d_v.z(), d_a.norm(),
                        d_w.norm(), d_alpha.norm(),
@@ -529,6 +536,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
                 "[DATA] 1kHz timing this run: %lu/%lu cycles period>1.5ms (worst %.1f ms), "
                 "min success_rate %.2f (1.00 = no command arrived late)",
                 n_long_cycles_, n_cycles_, worst_period_ms_, min_success_);
+    RCLCPP_WARN(get_logger(),
+                "[DATA] success_rate history: worst was at t=%.3f s; %lu cycles degraded "
+                "(<0.999), last one at t=%.3f s; the abort was at t=%.3f s "
+                "(t counts from control start; sr is a 100-cycle trailing average)",
+                min_success_t_, n_degraded_, last_degraded_t_, dbg_t_);
 
     std::string cls;
     if (reason.find("discontinuity") != std::string::npos) {
@@ -708,7 +720,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
   // the command WE returned arrived late) + control_command_success_rate (share of
   // the last 100 commands the robot actually received in time).
   double worst_period_ms_{0.0}, min_success_{1.0};
-  unsigned long n_long_cycles_{0}, n_cycles_{0};
+  double min_success_t_{0.0}, last_degraded_t_{0.0};
+  unsigned long n_long_cycles_{0}, n_cycles_{0}, n_degraded_{0};
   std::array<double, 6> last_wrench_{};
   std::array<double, 7> last_tau_ext_{};
 
