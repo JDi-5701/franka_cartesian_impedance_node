@@ -98,16 +98,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
     guard_pos_tol_ = declare_parameter<double>("guard_position_tolerance", 0.10);          // m
     guard_rot_tol_ = declare_parameter<double>("guard_rotation_tolerance_deg", 20.0)
                      * M_PI / 180.0;                                                       // rad
-    // CAPTURE phase after a GUARD release: do NOT hand the (up to guard-tolerance sized)
-    // residual to the tracking filter in one cycle — the filter chases it at the full
-    // accel caps, which the robot-side IK can amplify into joint accelerations beyond
-    // the per-joint limits (measured: 25 mm + 3.7 deg residual -> |ddq_d| 12.7 rad/s^2,
-    // limits 7.5-15 -> *_discontinuity reflex right after every homing handover).
-    // Instead creep an internal setpoint toward the target at these capped speeds —
-    // the filter then only sees a millimeter-scale moving target, like during homing.
-    capture_v_ = declare_parameter<double>("capture_velocity", 0.08);                      // m/s
-    capture_w_ = declare_parameter<double>("capture_angular_velocity_deg", 10.0)
-                 * M_PI / 180.0;                                                           // rad/s
     // Target GATE: reject a topic target that JUMPS vs the last ACCEPTED target
     // (upstream discontinuity: teleop re-anchor jump, deploy chain yanked by an
     // external homing, plain bugs). Compared against the accepted stream — NOT the
@@ -365,7 +355,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
       Eigen::Vector3d snap_tgt_p = Eigen::Vector3d::Zero();
       Eigen::Quaterniond snap_tgt_q = Eigen::Quaterniond::Identity();
       bool snap_has_tgt = false;
-      bool capturing = false;   // post-GUARD-release creep toward the topic target
 
       robot.control([&](const franka::RobotState& state,
                         franka::Duration period) -> franka::CartesianPose {
@@ -383,6 +372,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
           snap_tgt_q = cmd_q;
           hold_p_ = cmd_p;          // launch in GUARD, parked at the start pose, until a
           hold_q_ = cmd_q;          // near target_pose arrives (guard_active_ defaults true)
+          setp_p = cmd_p;           // reference governor starts at the current command
+          setp_q = cmd_q;
           // Capture the ACTUAL scheduling state of this thread once, now that
           // libfranka has applied its RT priority. Logged by the publisher
           // thread + every post-mortem so each log self-documents whether the
@@ -439,9 +430,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
                 goal_p = p;
                 goal_q = q;
                 homing_v = hv;
-                setp_p = cmd_p;       // new request: creep starts at the current command
-                setp_q = cmd_q;
-                homing_seq_seen = s1;
+                homing_seq_seen = s1;   // no re-seeding: the governor setpoint is continuous
               } else {
                 homing = false;       // torn mid-write this very ms: adopt next cycle
               }
@@ -470,71 +459,58 @@ class CartesianImpedanceNode : public rclcpp::Node {
           // release the guard once a fresh target is close enough to the current pose
           // (logged by the publisher thread — no logging from this RT callback)
           if (snap_has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
-            guard_active_ = false;
-            capturing = true;      // absorb the residual gently (see capture_velocity)
-            setp_p = cmd_p;
-            setp_q = cmd_q;
+            guard_active_ = false;   // residual is absorbed by the always-on governor
             evt_guard_released_.fetch_add(1, std::memory_order_relaxed);
           }
         }
-        if (!homing && guard_active_) {
-          tp = hold_p_;             // hold the parked pose; ignore target_pose
-          tq = hold_q_;
-        } else if (!homing) {
-          tp = snap_tgt_p;
-          tq = snap_tgt_q;
+        // Raw reference for this cycle + governor speed caps, by mode. In TOPIC the
+        // caps equal the overall motion caps, so on a healthy mm-scale stream the
+        // governor never binds and behavior is identical to direct tracking.
+        Eigen::Vector3d ref_p;
+        Eigen::Quaterniond ref_q;
+        double gov_v = max_v_;
+        double gov_w = max_w_;
+        if (homing) {
+          ref_p = goal_p;
+          ref_q = goal_q;
+          gov_v = homing_v;
+          gov_w = std::min(0.3, max_w_);
+        } else if (guard_active_) {
+          ref_p = hold_p_;          // hold the parked pose; ignore target_pose
+          ref_q = hold_q_;
+        } else {
+          ref_p = snap_tgt_p;
+          ref_q = snap_tgt_q;
         }
 
         double dt = period.toSec();
         if (dt <= 0.0) dt = 0.001;
 
-        // HOMING setpoint creep: do NOT feed the far goal to the tracking filter directly —
-        // a 0.3 m target jump saturates the accel clamp in one 1ms cycle (accel step ->
-        // *_acceleration_discontinuity reflex). Instead move an internal setpoint toward
-        // the goal at exactly the requested velocity and track THAT: the filter then only
-        // ever sees a millimeter-scale moving target, same as the verified teleop stream.
-        if (homing) {
-          const double step = homing_v * dt;
-          Eigen::Vector3d d = goal_p - setp_p;
-          const double dist = d.norm();
-          Eigen::Quaterniond dqs = goal_q * setp_q.inverse();
-          if (dqs.w() < 0) dqs.coeffs() *= -1.0;
-          const double ang = 2.0 * std::acos(std::min(1.0, std::abs(dqs.w())));
-          if (dist > step) {
-            const double frac = step / dist;      // rotation shares the fraction -> both
-            setp_p += d * frac;                   // translation and rotation arrive together
-            if (ang > 1e-6) setp_q = setp_q.slerp(frac, goal_q);
-          } else {
-            setp_p = goal_p;
-            // residual pure rotation: creep at a slow fixed angular rate
-            const double wstep = std::min(0.3, max_w_) * dt;   // rad per cycle
-            setp_q = (ang <= wstep) ? goal_q
-                                    : setp_q.slerp(wstep / std::max(ang, 1e-9), goal_q);
-          }
-          setp_q.normalize();
-          tp = setp_p;
-          tq = setp_q;
-        } else if (capturing && !guard_active_) {
-          // CAPTURE: creep the setpoint toward the (possibly moving) topic target with
-          // INDEPENDENT translation/rotation speed caps (homing couples rotation to the
-          // translation fraction — wrong for a rotation-dominant residual), then hand
-          // over to normal tracking once converged.
-          const double step = capture_v_ * dt;
-          Eigen::Vector3d d = tp - setp_p;
+        // Reference GOVERNOR (always on, all modes): the setpoint creeps toward the
+        // raw reference at the capped speeds; the tracking filter only ever sees a
+        // millimeter-scale moving target. This one mechanism covers homing (slow cap
+        // toward the goal), the post-GUARD-release residual (impedance sag between
+        // equilibrium and the re-anchored target), and any target jump that passed
+        // the gate — a stepped reference must NOT reach the filter directly: it
+        // saturates the accel clamp and the robot-side IK can amplify that into
+        // joint accelerations beyond per-joint limits (measured 25 mm + 3.7 deg ->
+        // |ddq_d| 12.7 rad/s^2 -> *_discontinuity reflex).
+        {
+          const double step = gov_v * dt;
+          const Eigen::Vector3d d = ref_p - setp_p;
           const double dist = d.norm();
           if (dist > step) setp_p += d * (step / dist);
-          else setp_p = tp;
-          Eigen::Quaterniond dqc = tq * setp_q.inverse();
-          if (dqc.w() < 0) dqc.coeffs() *= -1.0;
-          const double ang = 2.0 * std::acos(std::min(1.0, std::abs(dqc.w())));
-          const double wstep = capture_w_ * dt;
-          if (ang > wstep) setp_q = setp_q.slerp(wstep / std::max(ang, 1e-9), tq);
-          else setp_q = tq;
+          else setp_p = ref_p;
+          Eigen::Quaterniond dqs = ref_q * setp_q.inverse();
+          if (dqs.w() < 0) dqs.coeffs() *= -1.0;
+          const double ang = 2.0 * std::acos(std::min(1.0, std::abs(dqs.w())));
+          const double wstep = gov_w * dt;
+          if (ang > wstep) setp_q = setp_q.slerp(wstep / std::max(ang, 1e-9), ref_q);
+          else setp_q = ref_q;
           setp_q.normalize();
-          if (dist <= step && ang <= wstep) capturing = false;  // converged
-          tp = setp_p;
-          tq = setp_q;
         }
+        tp = setp_p;
+        tq = setp_q;
 
         // Velocity- AND acceleration-limited interpolation toward target (trapezoidal
         // profile). Smooth start/stop -> no velocity/acceleration discontinuity reflex.
@@ -977,7 +953,6 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double coll_torque_, coll_force_, cutoff_hz_;
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
   double guard_pos_tol_, guard_rot_tol_;
-  double capture_v_{0.08}, capture_w_{0.17};
   double gate_pos_{0.05}, gate_rot_{0.17};
   std::atomic<uint64_t> n_gate_rej_{0};
   double last_gate_t_{0.0};  // executor writes, post-mortem reads (benign race)
