@@ -205,25 +205,34 @@ class CartesianImpedanceNode : public rclcpp::Node {
   }
 
   // Shared homing motion: drive the equilibrium to (gp, gq) at velocity cap v, ignoring
-  // target_pose until reached. Blocks until reached (or timeout). The control loop does the
-  // motion and signals completion via homing_cv_; on success it latches target_ = goal so
-  // the arm holds there until a teleop/policy re-takes over. Returns success + fills msg.
+  // target_pose until reached. Blocks until reached (or timeout).
+  //
+  // RT contract with the 1kHz callback: the callback NEVER takes a mutex, logs, or
+  // notifies for homing. This thread publishes the request via a seqlock
+  // (homing_req_seq_ odd = write in progress) + the homing_active_ atomic, then POLLS
+  // homing_done_. The old cv/mutex handshake blocked the callback ~2 ms at every
+  // homing completion (service thread held homing_mtx_ through RCLCPP_INFO) -> late
+  // 1kHz commands -> success_rate collapse -> *_discontinuity reflex right after
+  // every go_pose. homing_mtx_ now only serializes concurrent service requests.
   bool driveToPose(const Eigen::Vector3d& gp, const Eigen::Quaterniond& gq, double v,
                    std::string& msg) {
-    {
-      std::lock_guard<std::mutex> lk(homing_mtx_);
-      homing_p_ = gp;
-      homing_q_ = gq.normalized();
-      homing_v_eff_ = v > 0.0 ? v : homing_velocity_;
-      homing_done_ = false;
-      homing_fresh_ = true;   // control loop re-seeds the creep setpoint at the cmd pose
-      homing_active_ = true;
-    }
+    std::lock_guard<std::mutex> svc(homing_mtx_);   // one request at a time
+    homing_done_ = false;
+    const uint32_t s = homing_req_seq_.load(std::memory_order_relaxed);
+    homing_req_seq_.store(s + 1, std::memory_order_release);   // odd: writing
+    homing_p_ = gp;
+    homing_q_ = gq.normalized();
+    homing_v_eff_ = v > 0.0 ? v : homing_velocity_;
+    homing_req_seq_.store(s + 2, std::memory_order_release);   // even: valid
+    homing_active_ = true;
     RCLCPP_INFO(get_logger(), "homing: to [% .3f % .3f % .3f] @ %.2f m/s",
                 gp.x(), gp.y(), gp.z(), homing_v_eff_);
-    std::unique_lock<std::mutex> lk(homing_mtx_);
-    const bool ok = homing_cv_.wait_for(
-        lk, std::chrono::duration<double>(homing_timeout_), [this] { return homing_done_; });
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(homing_timeout_));
+    while (!homing_done_ && rclcpp::ok() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool ok = homing_done_;
     if (!ok) homing_active_ = false;  // give up; the loop falls back to target_ (last cmd)
     msg = ok ? "reached home pose" : "homing timeout / not reached";
     RCLCPP_INFO(get_logger(), "homing: %s", msg.c_str());
@@ -300,16 +309,30 @@ class CartesianImpedanceNode : public rclcpp::Node {
       Eigen::Quaterniond setp_q = Eigen::Quaterniond::Identity();
       Eigen::Vector3d cmd_a = Eigen::Vector3d::Zero();   // last commanded accel (jerk clamp state)
       Eigen::Vector3d cmd_aw = Eigen::Vector3d::Zero();  // last commanded angular accel
+      // persistent across cycles: adopted homing request (seqlock snapshot) and the
+      // last successfully try_locked target snapshot (fallback when the lock is busy)
+      Eigen::Vector3d goal_p = Eigen::Vector3d::Zero();
+      Eigen::Quaterniond goal_q = Eigen::Quaterniond::Identity();
+      double homing_v = 0.0;
+      uint32_t homing_seq_seen = 0;
+      Eigen::Vector3d snap_tgt_p = Eigen::Vector3d::Zero();
+      Eigen::Quaterniond snap_tgt_q = Eigen::Quaterniond::Identity();
+      bool snap_has_tgt = false;
 
       robot.control([&](const franka::RobotState& state,
                         franka::Duration period) -> franka::CartesianPose {
         if (!initialized) {
           matrixToPose(state.O_T_EE_c, cmd_p, cmd_q);
           {
-            std::lock_guard<std::mutex> lk(target_mtx_);
+            // one-time seeding; try_lock so even the first cycle cannot block on the
+            // executor — on a miss just hold the current pose and retry next cycle
+            std::unique_lock<std::mutex> lk(target_mtx_, std::try_to_lock);
+            if (!lk.owns_lock()) return franka::CartesianPose(state.O_T_EE_c);
             target_p_ = cmd_p;
             target_q_ = cmd_q;
           }
+          snap_tgt_p = cmd_p;
+          snap_tgt_q = cmd_q;
           hold_p_ = cmd_p;          // launch in GUARD, parked at the start pose, until a
           hold_q_ = cmd_q;          // near target_pose arrives (guard_active_ defaults true)
           // Capture the ACTUAL scheduling state of this thread once, now that
@@ -353,50 +376,62 @@ class CartesianImpedanceNode : public rclcpp::Node {
         Eigen::Vector3d tp;
         Eigen::Quaterniond tq;
         double vcap = max_v_;
-        bool homing = false;
-        Eigen::Vector3d goal_p;
-        Eigen::Quaterniond goal_q;
-        double homing_v = 0.0;
-        {
-          std::lock_guard<std::mutex> lk(homing_mtx_);
-          homing = homing_active_;
-          if (homing) {
-            goal_p = homing_p_;
-            goal_q = homing_q_;
-            homing_v = homing_v_eff_;
-            if (homing_fresh_) {   // new homing request: creep starts at the current command
-              setp_p = cmd_p;
-              setp_q = cmd_q;
-              homing_fresh_ = false;
+        // Lock-free homing-request snapshot (seqlock written by driveToPose). The old
+        // per-cycle homing_mtx_ lock let a normal-priority service thread block this
+        // RT callback (priority inversion, proven ~2 ms stalls at every handover).
+        bool homing = homing_active_.load(std::memory_order_acquire);
+        if (homing) {
+          const uint32_t s1 = homing_req_seq_.load(std::memory_order_acquire);
+          if (s1 != homing_seq_seen) {
+            if ((s1 & 1u) == 0u) {
+              const Eigen::Vector3d p = homing_p_;
+              const Eigen::Quaterniond q = homing_q_;
+              const double hv = homing_v_eff_;
+              if (homing_req_seq_.load(std::memory_order_acquire) == s1) {
+                goal_p = p;
+                goal_q = q;
+                homing_v = hv;
+                setp_p = cmd_p;       // new request: creep starts at the current command
+                setp_q = cmd_q;
+                homing_seq_seen = s1;
+              } else {
+                homing = false;       // torn mid-write this very ms: adopt next cycle
+              }
+            } else {
+              homing = false;         // write in progress: adopt next cycle
             }
-            vcap = std::min(max_v_, homing_v_eff_);
+          }
+          if (homing) vcap = std::min(max_v_, homing_v);
+        }
+        // Target snapshot: try_lock only — if the executor thread happens to hold the
+        // lock this microsecond, reuse last cycle's snapshot instead of blocking.
+        {
+          std::unique_lock<std::mutex> lk(target_mtx_, std::try_to_lock);
+          if (lk.owns_lock()) {
+            snap_has_tgt = have_target_;
+            snap_tgt_p = target_p_;
+            snap_tgt_q = target_q_;
           }
         }
         // gap between the latest target_pose and the measured pose (guard + status readout)
-        double tgt_pos_err, tgt_rot_err;
-        bool has_tgt;
-        {
-          std::lock_guard<std::mutex> lk(target_mtx_);
-          has_tgt = have_target_;
-          tgt_pos_err = (target_p_ - meas_p).norm();
-          Eigen::Quaterniond dqt = target_q_ * meas_q.inverse();
-          if (dqt.w() < 0) dqt.coeffs() *= -1.0;
-          tgt_rot_err = 2.0 * std::acos(std::min(1.0, std::abs(dqt.w())));
-        }
+        double tgt_pos_err = (snap_tgt_p - meas_p).norm();
+        Eigen::Quaterniond dqt = snap_tgt_q * meas_q.inverse();
+        if (dqt.w() < 0) dqt.coeffs() *= -1.0;
+        double tgt_rot_err = 2.0 * std::acos(std::min(1.0, std::abs(dqt.w())));
         if (!homing && guard_active_) {
           // release the guard once a fresh target is close enough to the current pose
-          if (has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
+          // (logged by the publisher thread — no logging from this RT callback)
+          if (snap_has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
             guard_active_ = false;
-            RCLCPP_INFO(get_logger(), "GUARD released -> TOPIC control");
+            evt_guard_released_.fetch_add(1, std::memory_order_relaxed);
           }
         }
         if (!homing && guard_active_) {
           tp = hold_p_;             // hold the parked pose; ignore target_pose
           tq = hold_q_;
         } else if (!homing) {
-          std::lock_guard<std::mutex> lk(target_mtx_);
-          tp = target_p_;
-          tq = target_q_;
+          tp = snap_tgt_p;
+          tq = snap_tgt_q;
         }
 
         double dt = period.toSec();
@@ -483,21 +518,24 @@ class CartesianImpedanceNode : public rclcpp::Node {
           if (dqh.w() < 0) dqh.coeffs() *= -1.0;
           double rerr = 2.0 * std::acos(std::min(1.0, std::abs(dqh.w())));
           if (perr < homing_pos_tol_ && rerr < homing_rot_tol_ && cmd_v.norm() < 0.005) {
-            {
-              std::lock_guard<std::mutex> lk(target_mtx_);
+            // try_lock: on a miss simply stay in HOMING one more 1 ms cycle and retry.
+            // Completion is atomics only — the service thread POLLS homing_done_
+            // (no cv/notify/log from this RT callback).
+            std::unique_lock<std::mutex> lk(target_mtx_, std::try_to_lock);
+            if (lk.owns_lock()) {
               target_p_ = goal_p;
               target_q_ = goal_q;
               have_target_ = true;
-            }
-            {
-              std::lock_guard<std::mutex> lk(homing_mtx_);
+              lk.unlock();
+              snap_tgt_p = goal_p;
+              snap_tgt_q = goal_q;
+              snap_has_tgt = true;
+              hold_p_ = goal_p;      // park here and GUARD until a near target_pose arrives
+              hold_q_ = goal_q;      // (else teleop's stale equilibrium would yank the arm)
+              guard_active_ = true;
               homing_active_ = false;
               homing_done_ = true;
             }
-            hold_p_ = goal_p;        // park here and GUARD until a near target_pose arrives
-            hold_q_ = goal_q;        // (else teleop's stale equilibrium would yank the arm)
-            guard_active_ = true;
-            homing_cv_.notify_all();
           }
         }
 
@@ -835,6 +873,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
         rt_logged_ = true;
         RCLCPP_INFO(get_logger(), "%s", rtStatusLine().c_str());
       }
+      // events the RT callback may not log itself
+      if (evt_guard_released_.exchange(0, std::memory_order_relaxed) > 0)
+        RCLCPP_INFO(get_logger(), "GUARD released -> TOPIC control");
       // advisory control-mode status at ~1/50 of the state rate (20 Hz at 1kHz)
       if (++status_ctr >= 50) {
         status_ctr = 0;
@@ -902,12 +943,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
   Eigen::Quaterniond target_q_{Eigen::Quaterniond::Identity()};
   bool have_target_{false};
 
-  // homing (~/go_home): control thread reads homing_active_; service waits on homing_cv_.
+  // homing (~/go_home): request data (homing_p_/q_/v_eff_) is seqlock-published by the
+  // service thread (homing_req_seq_ odd = write in progress); the 1kHz callback reads it
+  // lock-free and reports completion via atomics that the service thread POLLS.
+  // homing_mtx_ only serializes concurrent service requests — the callback never takes it.
   std::mutex homing_mtx_;
-  std::condition_variable homing_cv_;
-  bool homing_active_{false};
-  bool homing_done_{false};
-  bool homing_fresh_{false};   // set per request; control loop re-seeds the creep setpoint
+  std::atomic<uint32_t> homing_req_seq_{0};
+  std::atomic<bool> homing_active_{false};
+  std::atomic<bool> homing_done_{false};
+  // events fired inside the RT callback, logged by the publisher thread
+  std::atomic<int> evt_guard_released_{0};
   Eigen::Vector3d homing_p_{Eigen::Vector3d::Zero()};
   Eigen::Quaterniond homing_q_{Eigen::Quaterniond::Identity()};
   double homing_v_eff_{0.08};
