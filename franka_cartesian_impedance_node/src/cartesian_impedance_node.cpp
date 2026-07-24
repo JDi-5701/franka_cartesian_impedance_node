@@ -15,6 +15,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -156,6 +157,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // scripts/nuc_rt_tune.sh. Late eno1 packet processing at normal priority was
     // the prime suspect for communication_constraints_violation / *_discontinuity.
     control_cpu_ = (int)declare_parameter<int>("control_thread_cpu", 14);
+    // NIC of the FCI link — only used to READ /sys/class/net/<nic>/threaded for
+    // the [RT] status line (was nuc_rt_tune.sh run since the last boot?).
+    fci_nic_ = declare_parameter<std::string>("fci_nic", "eno1");
 
 #ifndef BUILD_VERSION
 #define BUILD_VERSION "unversioned"
@@ -308,6 +312,20 @@ class CartesianImpedanceNode : public rclcpp::Node {
           }
           hold_p_ = cmd_p;          // launch in GUARD, parked at the start pose, until a
           hold_q_ = cmd_q;          // near target_pose arrives (guard_active_ defaults true)
+          // Capture the ACTUAL scheduling state of this thread once, now that
+          // libfranka has applied its RT priority. Logged by the publisher
+          // thread + every post-mortem so each log self-documents whether the
+          // CPU-dedication fix (launch taskset + control_thread_cpu +
+          // nuc_rt_tune.sh) was really in effect for that run.
+          {
+            int pol = -1;
+            struct sched_param sp {};
+            pthread_getschedparam(pthread_self(), &pol, &sp);
+            rt_policy_ = pol;
+            rt_prio_ = sp.sched_priority;
+            rt_cpu_ = sched_getcpu();
+            rt_captured_ = true;
+          }
           initialized = true;
         }
 
@@ -583,6 +601,32 @@ class CartesianImpedanceNode : public rclcpp::Node {
     running_ = false;
   }
 
+  // One line proving whether the CPU-dedication fix was ACTIVE for this run:
+  // the control thread's real scheduler/priority/CPU (captured on the first
+  // 1kHz cycle, after libfranka applied its RT priority) + whether the robot
+  // NIC's threaded-NAPI (nuc_rt_tune.sh) is on. Guards against silently
+  // benchmarking with the fix half-applied (e.g. tune script not re-run after
+  // a reboot).
+  std::string rtStatusLine() {
+    char buf[256];
+    const int pol = rt_policy_.load();
+    const char* pols = pol == SCHED_FIFO ? "FIFO" : pol == SCHED_RR ? "RR" :
+                       pol == SCHED_OTHER ? "OTHER(!)" : "unknown";
+    std::string napi = "unreadable";
+    if (FILE* f = fopen(("/sys/class/net/" + fci_nic_ + "/threaded").c_str(), "r")) {
+      int v = -1;
+      if (fscanf(f, "%d", &v) == 1) napi = v == 1 ? "ON" : "OFF(!)";
+      fclose(f);
+    }
+    snprintf(buf, sizeof(buf),
+             "[RT] control thread: CPU %d (want %d), sched %s prio %d%s; %s threaded "
+             "NAPI %s (nuc_rt_tune.sh %s)",
+             rt_cpu_.load(), control_cpu_, pols, rt_prio_.load(),
+             rt_captured_ ? "" : " (not captured yet)", fci_nic_.c_str(), napi.c_str(),
+             napi == "ON" ? "ran" : "NOT run since boot?");
+    return std::string(buf);
+  }
+
   // Reflex post-mortem in three clearly separated sections:
   //   [LIBFRANKA] verbatim error text from the robot — the ground truth.
   //   [DATA]      values recorded by THIS node (robot state + our command stream).
@@ -591,6 +635,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
     RCLCPP_ERROR(get_logger(), "================ REFLEX POST-MORTEM ================");
     RCLCPP_ERROR(get_logger(), "[VERSION] %s, compiled %s %s", BUILD_VERSION, __DATE__, __TIME__);
     RCLCPP_ERROR(get_logger(), "[LIBFRANKA] raw error: %s", reason.c_str());
+    RCLCPP_WARN(get_logger(), "%s", rtStatusLine().c_str());
 
     RCLCPP_WARN(get_logger(), "[DATA] robot state at abort vs OUR collision thresholds:");
     const char* wn[6] = {"Fx[N]", "Fy[N]", "Fz[N]", "Tx[Nm]", "Ty[Nm]", "Tz[Nm]"};
@@ -785,6 +830,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
         }
       }
       if (fresh) publishState(s);
+      // one-shot: control loop is up -> log the real RT state of this run
+      if (!rt_logged_ && rt_captured_) {
+        rt_logged_ = true;
+        RCLCPP_INFO(get_logger(), "%s", rtStatusLine().c_str());
+      }
       // advisory control-mode status at ~1/50 of the state rate (20 Hz at 1kHz)
       if (++status_ctr >= 50) {
         status_ctr = 0;
@@ -878,6 +928,10 @@ class CartesianImpedanceNode : public rclcpp::Node {
   // 1kHz-callback -> publisher-thread hand-off (see statePublishLoop)
   double state_pub_rate_{1000.0};
   int control_cpu_{14};
+  std::string fci_nic_;
+  std::atomic<int> rt_cpu_{-1}, rt_policy_{-1}, rt_prio_{-1};
+  std::atomic<bool> rt_captured_{false};
+  bool rt_logged_{false};  // publisher thread only
   std::thread pub_thread_;
   std::mutex pub_state_mtx_;
   franka::RobotState pub_state_{};
