@@ -60,4 +60,20 @@ fi
 kpid=$(ps -e -o pid=,comm= | awk -v c="ksoftirqd/$ROBOT_CPU" '$2==c {print $1}')
 [ -n "$kpid" ] && chrt -f -p 49 "$kpid" && echo "ksoftirqd/$ROBOT_CPU (pid $kpid) -> SCHED_FIFO 49"
 
+# CPU idle states (added 2026-07-24, after the priority fix alone changed
+# nothing): a DEDICATED core is idle most of every 1 ms cycle and drops into
+# deep C-states — C3 on this NUC costs 350 us exit latency, paid on every robot
+# packet / control-thread wakeup. That chronic sub-ms lateness is what the robot
+# counts as late commands (sr 0.58 with an otherwise clean system). Disable
+# every idle state deeper than 10 us on the dedicated CPUs 14/15 AND their SMT
+# siblings 6/7 (same physical cores — the core only sleeps deep if both
+# hyperthreads do). POLL/C1 (<=1 us) stay enabled.
+for cpu in 6 7 14 15; do
+  for st in /sys/devices/system/cpu/cpu"$cpu"/cpuidle/state*; do
+    lat=$(cat "$st/latency")
+    [ "$lat" -gt 10 ] && echo 1 > "$st/disable"
+  done
+  echo "cpu$cpu: idle states deeper than 10us disabled"
+done
+
 echo "done. Verify: ps -eLo rtprio,policy,psr,comm | grep -E 'napi/$ROBOT_IF|ksoftirqd/$ROBOT_CPU'"
