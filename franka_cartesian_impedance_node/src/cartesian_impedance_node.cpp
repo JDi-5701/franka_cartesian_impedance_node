@@ -5,6 +5,9 @@
 // You publish a target TCP pose; the robot tracks it compliantly. IK/dynamics/gravity/
 // friction are all handled inside the robot. We only do rate-limited interpolation.
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -146,6 +149,14 @@ class CartesianImpedanceNode : public rclcpp::Node {
     // return -> the robot sees a late/merged cycle -> *_discontinuity reflex.
     state_pub_rate_ = declare_parameter<double>("state_publish_rate", 1000.0);
 
+    // CPU the libfranka control thread pins itself to (-1 = don't pin). The launch
+    // file confines the whole process to CPUs 0-13 (taskset prefix) so DDS/executor
+    // threads cannot land on 14/15; the control thread escapes to this core, next to
+    // CPU15 where the eno1 IRQ + its (RT-boosted) packet processing live — see
+    // scripts/nuc_rt_tune.sh. Late eno1 packet processing at normal priority was
+    // the prime suspect for communication_constraints_violation / *_discontinuity.
+    control_cpu_ = (int)declare_parameter<int>("control_thread_cpu", 14);
+
 #ifndef BUILD_VERSION
 #define BUILD_VERSION "unversioned"
 #endif
@@ -249,6 +260,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
   }
 
   void controlLoop() {
+    if (control_cpu_ >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(control_cpu_, &set);
+      if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0)
+        RCLCPP_INFO(get_logger(), "control thread pinned to CPU %d", control_cpu_);
+      else
+        RCLCPP_WARN(get_logger(), "failed to pin control thread to CPU %d (running unpinned)",
+                    control_cpu_);
+    }
     try {
       franka::Robot robot(robot_ip_);
 
@@ -856,6 +877,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
 
   // 1kHz-callback -> publisher-thread hand-off (see statePublishLoop)
   double state_pub_rate_{1000.0};
+  int control_cpu_{14};
   std::thread pub_thread_;
   std::mutex pub_state_mtx_;
   franka::RobotState pub_state_{};

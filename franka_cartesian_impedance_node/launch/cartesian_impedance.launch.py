@@ -15,13 +15,23 @@ def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument(
         "robot_ip", default_value="192.168.3.100",
         description="Robot IP (overrides impedance_params.yaml)")
+    # Keep every process thread (DDS, executor, state publisher) off CPUs 14/15:
+    # CPU15 handles the eno1 (FCI) IRQ + packet processing, CPU14 is where the
+    # libfranka control thread pins itself (control_thread_cpu param). Pair with
+    # scripts/nuc_rt_tune.sh which RT-boosts the packet processing on CPU15.
+    cpus_arg = DeclareLaunchArgument(
+        "process_cpus", default_value="0-13",
+        description="CPU list the node process is confined to (control thread escapes"
+                    " to control_thread_cpu)")
     return LaunchDescription([
         robot_ip_arg,
+        cpus_arg,
         Node(
             package="franka_cartesian_impedance_node",
             executable="cartesian_impedance_node",
             name="cartesian_impedance_node",
             output="screen",
+            prefix=["taskset -c ", LaunchConfiguration("process_cpus"), " "],
             parameters=[params, {"robot_ip": LaunchConfiguration("robot_ip")}],
         ),
     ])
