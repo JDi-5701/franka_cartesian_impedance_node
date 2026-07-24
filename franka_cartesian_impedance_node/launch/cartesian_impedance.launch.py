@@ -19,8 +19,11 @@ def generate_launch_description():
     # CPU15 handles the eno1 (FCI) IRQ + packet processing, CPU14 is where the
     # libfranka control thread pins itself (control_thread_cpu param). Pair with
     # scripts/nuc_rt_tune.sh which RT-boosts the packet processing on CPU15.
+    # CPUs 6/7 are the SMT siblings of 14/15 on this NUC (lscpu -e: CPU6/14 =
+    # core 6, CPU7/15 = core 7) — excluded too so the dedicated threads get the
+    # whole physical core, not half of one.
     cpus_arg = DeclareLaunchArgument(
-        "process_cpus", default_value="0-13",
+        "process_cpus", default_value="0-5,8-13",
         description="CPU list the node process is confined to (control thread escapes"
                     " to control_thread_cpu)")
     return LaunchDescription([
