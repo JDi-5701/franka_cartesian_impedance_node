@@ -108,6 +108,17 @@ class CartesianImpedanceNode : public rclcpp::Node {
     capture_v_ = declare_parameter<double>("capture_velocity", 0.08);                      // m/s
     capture_w_ = declare_parameter<double>("capture_angular_velocity_deg", 10.0)
                  * M_PI / 180.0;                                                           // rad/s
+    // Target GATE: reject a topic target that JUMPS vs the last ACCEPTED target
+    // (upstream discontinuity: teleop re-anchor jump, deploy chain yanked by an
+    // external homing, plain bugs). Compared against the accepted stream — NOT the
+    // measured pose (contact deflection would false-trigger) and NOT the tracked
+    // command (dynamic lag would false-trigger at speed). On rejection the mailbox
+    // keeps the last good target (arm holds); both known upstreams re-anchor toward
+    // the measured pose when not followed, so the stream recovers and the gate
+    // reopens by itself. <=0 disables.
+    gate_pos_ = declare_parameter<double>("target_gate_position", 0.05);                   // m
+    gate_rot_ = declare_parameter<double>("target_gate_rotation_deg", 10.0)
+                * M_PI / 180.0;                                                            // rad
     // Default home pose [x, y, z, qx, qy, qz, qw] (base frame). Used by ~/go_home (Trigger)
     // and by ~/go_pose when its request carries no pose (empty / zero quaternion).
     auto hp = declare_parameter<std::vector<double>>(
@@ -208,10 +219,36 @@ class CartesianImpedanceNode : public rclcpp::Node {
     last_raw_p_ = p;
     last_raw_q_ = q;
     have_last_raw_ = true;
-    std::lock_guard<std::mutex> lk(target_mtx_);
-    target_p_ = p;
-    target_q_ = q;
-    have_target_ = true;
+    double rej_pos = -1.0, rej_rot = 0.0;
+    {
+      std::lock_guard<std::mutex> lk(target_mtx_);
+      if (gate_pos_ > 0.0 && have_target_) {
+        const double gp = (p - target_p_).norm();
+        Eigen::Quaterniond gq = q * target_q_.inverse();
+        if (gq.w() < 0) gq.coeffs() *= -1.0;
+        const double gr = 2.0 * std::acos(std::min(1.0, std::abs(gq.w())));
+        if (gp > gate_pos_ || gr > gate_rot_) {
+          rej_pos = gp;
+          rej_rot = gr;
+        }
+      }
+      if (rej_pos < 0.0) {
+        target_p_ = p;
+        target_q_ = q;
+        have_target_ = true;
+      }
+    }
+    if (rej_pos >= 0.0) {  // log OUTSIDE the lock (RT callback try_locks it)
+      n_gate_rej_.fetch_add(1, std::memory_order_relaxed);
+      last_gate_t_ = dbg_t_;
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "target GATE: rejected jump of %.1f mm / %.1f deg vs last accepted target "
+          "(limits %.0f mm / %.0f deg) — holding last good target until the stream "
+          "comes back",
+          rej_pos * 1000.0, rej_rot * 180.0 / M_PI,
+          gate_pos_ * 1000.0, gate_rot_ * 180.0 / M_PI);
+    }
   }
 
   // Shared homing motion: drive the equilibrium to (gp, gq) at velocity cap v, ignoring
@@ -751,6 +788,12 @@ class CartesianImpedanceNode : public rclcpp::Node {
                 "t=%.3f s (10 Hz stream: normal step = speed/10)",
                 peak_tgt_step_pos_ * 1000.0, peak_tgt_step_pos_t_,
                 peak_tgt_step_rot_, peak_tgt_step_rot_t_);
+    RCLCPP_WARN(get_logger(),
+                "[DATA] target GATE: %lu upstream jumps rejected this run%s",
+                (unsigned long)n_gate_rej_.load(),
+                n_gate_rej_.load() ? "" : " (none)");
+    if (n_gate_rej_.load())
+      RCLCPP_WARN(get_logger(), "[DATA]   last rejection at t=%.3f s", last_gate_t_);
 
     std::string cls;
     if (reason.find("discontinuity") != std::string::npos) {
@@ -935,6 +978,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
   double guard_pos_tol_, guard_rot_tol_;
   double capture_v_{0.08}, capture_w_{0.17};
+  double gate_pos_{0.05}, gate_rot_{0.17};
+  std::atomic<uint64_t> n_gate_rej_{0};
+  double last_gate_t_{0.0};  // executor writes, post-mortem reads (benign race)
   std::string joint_prefix_;
 
   // debug
