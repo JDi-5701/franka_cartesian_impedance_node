@@ -98,6 +98,12 @@ class CartesianImpedanceNode : public rclcpp::Node {
     guard_pos_tol_ = declare_parameter<double>("guard_position_tolerance", 0.10);          // m
     guard_rot_tol_ = declare_parameter<double>("guard_rotation_tolerance_deg", 20.0)
                      * M_PI / 180.0;                                                       // rad
+    // Minimum GUARD dwell before release. The mailbox is a continuously overwritten
+    // stream: right after a homing arrives it can still hold a target the teleop
+    // anchored to an IN-FLIGHT pose sample (pipeline latency while the robot moved
+    // -> tens of mm stale). Dwelling lets the upstream re-anchor on the SETTLED pose,
+    // so release happens against a fresh target and the handover residual ~ 0.
+    guard_min_hold_ = declare_parameter<double>("guard_min_hold", 2.0);                    // s
     // Target GATE: reject a topic target that JUMPS vs the last ACCEPTED target
     // (upstream discontinuity: teleop re-anchor jump, deploy chain yanked by an
     // external homing, plain bugs). Compared against the accepted stream — NOT the
@@ -457,9 +463,11 @@ class CartesianImpedanceNode : public rclcpp::Node {
         double tgt_rot_err = 2.0 * std::acos(std::min(1.0, std::abs(dqt.w())));
         if (!homing && guard_active_) {
           // release the guard once a fresh target is close enough to the current pose
-          // (logged by the publisher thread — no logging from this RT callback)
-          if (snap_has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
-            guard_active_ = false;   // residual is absorbed by the always-on governor
+          // AND the guard has dwelt long enough for the upstream to re-anchor on the
+          // settled pose (logged by the publisher thread — no logging from this callback)
+          if (snap_has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_ &&
+              dbg_t_ - guard_since_ >= guard_min_hold_) {
+            guard_active_ = false;   // any remaining residual: always-on governor
             evt_guard_released_.fetch_add(1, std::memory_order_relaxed);
           }
         }
@@ -580,6 +588,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
               hold_p_ = goal_p;      // park here and GUARD until a near target_pose arrives
               hold_q_ = goal_q;      // (else teleop's stale equilibrium would yank the arm)
               guard_active_ = true;
+              guard_since_ = dbg_t_;  // start the min-dwell clock
               homing_active_ = false;
               homing_done_ = true;
             }
@@ -953,6 +962,8 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double coll_torque_, coll_force_, cutoff_hz_;
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
   double guard_pos_tol_, guard_rot_tol_;
+  double guard_min_hold_{2.0};
+  double guard_since_{0.0};   // control-thread only (dbg_t_ clock)
   double gate_pos_{0.05}, gate_rot_{0.17};
   std::atomic<uint64_t> n_gate_rej_{0};
   double last_gate_t_{0.0};  // executor writes, post-mortem reads (benign race)
