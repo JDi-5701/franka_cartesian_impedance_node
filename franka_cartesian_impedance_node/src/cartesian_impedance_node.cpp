@@ -98,6 +98,16 @@ class CartesianImpedanceNode : public rclcpp::Node {
     guard_pos_tol_ = declare_parameter<double>("guard_position_tolerance", 0.10);          // m
     guard_rot_tol_ = declare_parameter<double>("guard_rotation_tolerance_deg", 20.0)
                      * M_PI / 180.0;                                                       // rad
+    // CAPTURE phase after a GUARD release: do NOT hand the (up to guard-tolerance sized)
+    // residual to the tracking filter in one cycle — the filter chases it at the full
+    // accel caps, which the robot-side IK can amplify into joint accelerations beyond
+    // the per-joint limits (measured: 25 mm + 3.7 deg residual -> |ddq_d| 12.7 rad/s^2,
+    // limits 7.5-15 -> *_discontinuity reflex right after every homing handover).
+    // Instead creep an internal setpoint toward the target at these capped speeds —
+    // the filter then only sees a millimeter-scale moving target, like during homing.
+    capture_v_ = declare_parameter<double>("capture_velocity", 0.08);                      // m/s
+    capture_w_ = declare_parameter<double>("capture_angular_velocity_deg", 10.0)
+                 * M_PI / 180.0;                                                           // rad/s
     // Default home pose [x, y, z, qx, qy, qz, qw] (base frame). Used by ~/go_home (Trigger)
     // and by ~/go_pose when its request carries no pose (empty / zero quaternion).
     auto hp = declare_parameter<std::vector<double>>(
@@ -318,6 +328,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
       Eigen::Vector3d snap_tgt_p = Eigen::Vector3d::Zero();
       Eigen::Quaterniond snap_tgt_q = Eigen::Quaterniond::Identity();
       bool snap_has_tgt = false;
+      bool capturing = false;   // post-GUARD-release creep toward the topic target
 
       robot.control([&](const franka::RobotState& state,
                         franka::Duration period) -> franka::CartesianPose {
@@ -423,6 +434,9 @@ class CartesianImpedanceNode : public rclcpp::Node {
           // (logged by the publisher thread — no logging from this RT callback)
           if (snap_has_tgt && tgt_pos_err < guard_pos_tol_ && tgt_rot_err < guard_rot_tol_) {
             guard_active_ = false;
+            capturing = true;      // absorb the residual gently (see capture_velocity)
+            setp_p = cmd_p;
+            setp_q = cmd_q;
             evt_guard_released_.fetch_add(1, std::memory_order_relaxed);
           }
         }
@@ -461,6 +475,26 @@ class CartesianImpedanceNode : public rclcpp::Node {
                                     : setp_q.slerp(wstep / std::max(ang, 1e-9), goal_q);
           }
           setp_q.normalize();
+          tp = setp_p;
+          tq = setp_q;
+        } else if (capturing && !guard_active_) {
+          // CAPTURE: creep the setpoint toward the (possibly moving) topic target with
+          // INDEPENDENT translation/rotation speed caps (homing couples rotation to the
+          // translation fraction — wrong for a rotation-dominant residual), then hand
+          // over to normal tracking once converged.
+          const double step = capture_v_ * dt;
+          Eigen::Vector3d d = tp - setp_p;
+          const double dist = d.norm();
+          if (dist > step) setp_p += d * (step / dist);
+          else setp_p = tp;
+          Eigen::Quaterniond dqc = tq * setp_q.inverse();
+          if (dqc.w() < 0) dqc.coeffs() *= -1.0;
+          const double ang = 2.0 * std::acos(std::min(1.0, std::abs(dqc.w())));
+          const double wstep = capture_w_ * dt;
+          if (ang > wstep) setp_q = setp_q.slerp(wstep / std::max(ang, 1e-9), tq);
+          else setp_q = tq;
+          setp_q.normalize();
+          if (dist <= step && ang <= wstep) capturing = false;  // converged
           tp = setp_p;
           tq = setp_q;
         }
@@ -900,6 +934,7 @@ class CartesianImpedanceNode : public rclcpp::Node {
   double coll_torque_, coll_force_, cutoff_hz_;
   double homing_velocity_, homing_pos_tol_, homing_rot_tol_, homing_timeout_;
   double guard_pos_tol_, guard_rot_tol_;
+  double capture_v_{0.08}, capture_w_{0.17};
   std::string joint_prefix_;
 
   // debug
