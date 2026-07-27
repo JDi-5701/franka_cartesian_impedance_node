@@ -28,6 +28,17 @@ if(NOT GIT_REV)
 endif()
 string(TIMESTAMP BUILD_STAMP "%Y-%m-%d %H:%M")
 add_compile_definitions(BUILD_VERSION="${GIT_REV} built ${BUILD_STAMP}")
+# Without this, a plain rebuild reuses the cached configure step and the baked
+# string above goes stale (bit us on 2026-07-27: binary said d0e258e while the
+# code was e668694). Re-run configure whenever the git HEAD moves.
+execute_process(COMMAND git rev-parse --absolute-git-dir
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE GIT_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(GIT_DIR)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${GIT_DIR}/HEAD" "${GIT_DIR}/index")
+endif()
 
 add_executable(cartesian_impedance_node src/cartesian_impedance_node.cpp)
 target_include_directories(cartesian_impedance_node PRIVATE ${EIGEN3_INCLUDE_DIRS})

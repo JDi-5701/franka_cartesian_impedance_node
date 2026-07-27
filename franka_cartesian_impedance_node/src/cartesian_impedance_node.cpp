@@ -186,6 +186,21 @@ class CartesianImpedanceNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "VERSION: %s, compiled %s %s",
                 BUILD_VERSION, __DATE__, __TIME__);
 
+    // A downshifted FCI link (100/10 Mb/s = a broken cable pair) multiplies
+    // serialization delay ~10x and surfaces as communication_constraints_violation.
+    // Bitten on 2026-07-24: eno1 stuck at 100 Mb/s, dmesg "check cabling!".
+    const int mbps = nicSpeedMbps();
+    if (mbps <= 0)
+      RCLCPP_WARN(get_logger(), "%s link down or speed unreadable — is this the FCI NIC?",
+                  fci_nic_.c_str());
+    else if (mbps < 1000)
+      RCLCPP_ERROR(get_logger(),
+                   "%s link is only %d Mb/s — DOWNSHIFTED. Reseat/replace the robot cable "
+                   "(dmesg | grep %s), expect communication reflexes at this speed!",
+                   fci_nic_.c_str(), mbps, fci_nic_.c_str());
+    else
+      RCLCPP_INFO(get_logger(), "%s link speed: %d Mb/s", fci_nic_.c_str(), mbps);
+
     control_thread_ = std::thread(&CartesianImpedanceNode::controlLoop, this);
     pub_thread_ = std::thread(&CartesianImpedanceNode::statePublishLoop, this);
   }
@@ -701,8 +716,18 @@ class CartesianImpedanceNode : public rclcpp::Node {
   // NIC's threaded-NAPI (nuc_rt_tune.sh) is on. Guards against silently
   // benchmarking with the fix half-applied (e.g. tune script not re-run after
   // a reboot).
+  // Negotiated link speed of the FCI NIC in Mb/s (-1: link down / unreadable).
+  int nicSpeedMbps() {
+    int v = -1;
+    if (FILE* f = fopen(("/sys/class/net/" + fci_nic_ + "/speed").c_str(), "r")) {
+      if (fscanf(f, "%d", &v) != 1) v = -1;
+      fclose(f);
+    }
+    return v;
+  }
+
   std::string rtStatusLine() {
-    char buf[256];
+    char buf[320];
     const int pol = rt_policy_.load();
     const char* pols = pol == SCHED_FIFO ? "FIFO" : pol == SCHED_RR ? "RR" :
                        pol == SCHED_OTHER ? "OTHER(!)" : "unknown";
@@ -712,12 +737,14 @@ class CartesianImpedanceNode : public rclcpp::Node {
       if (fscanf(f, "%d", &v) == 1) napi = v == 1 ? "ON" : "OFF(!)";
       fclose(f);
     }
+    const int mbps = nicSpeedMbps();
     snprintf(buf, sizeof(buf),
              "[RT] control thread: CPU %d (want %d), sched %s prio %d%s; %s threaded "
-             "NAPI %s (nuc_rt_tune.sh %s)",
+             "NAPI %s (nuc_rt_tune.sh %s), link %d Mb/s%s",
              rt_cpu_.load(), control_cpu_, pols, rt_prio_.load(),
              rt_captured_ ? "" : " (not captured yet)", fci_nic_.c_str(), napi.c_str(),
-             napi == "ON" ? "ran" : "NOT run since boot?");
+             napi == "ON" ? "ran" : "NOT run since boot?", mbps,
+             (mbps > 0 && mbps < 1000) ? " DOWNSHIFTED(!)" : "");
     return std::string(buf);
   }
 
